@@ -105,10 +105,13 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
     /// single-threaded pixel-storage conversion. Can give a substantial
     /// speedup on multi-core machines, at the cost of a different
     /// `set_row_pixel` closure signature: it receives one row of the pixel
-    /// storage plus an `x` index, rather than the whole storage plus a
-    /// `Vec2` position, since concurrent workers only ever get access to
-    /// their own disjoint row range. Requires `PixelStorage` to implement
-    /// [`RowMajorPixelStorage`] (implemented for `Vec<Vec<Pixel>>`).
+    /// storage as a slice plus an `x` index, rather than the whole storage
+    /// plus a `Vec2` position, since concurrent workers only ever get access
+    /// to their own disjoint row range. Requires `PixelStorage` to implement
+    /// [`RowMajorPixelStorage`] (implemented by [`FlatRowMajorPixelStorage`]).
+    /// A single contiguous buffer is required (rather than one `Vec` per row)
+    /// so that worker threads split disjoint row ranges directly out of it,
+    /// instead of writing into scattered, independently heap-allocated rows.
     #[cfg(feature = "rayon")]
     fn collect_pixels_in_parallel<Pixel, PixelStorage, CreatePixels, SetRowPixel>(
         self, create_pixels: CreatePixels, set_row_pixel: SetRowPixel
@@ -121,7 +124,7 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
                 &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
             ) -> PixelStorage,
             PixelStorage: RowMajorPixelStorage,
-            SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel),
+            SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel),
     {
         CollectPixelsInParallel {
             read_channels: self,
@@ -132,30 +135,52 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
     }
 }
 
-/// Pixel storage whose rows can be accessed and mutated independently of one
-/// another. Enables [`ReadSpecificChannel::collect_pixels_in_parallel`] to
-/// hand out disjoint row ranges to decompression worker threads instead of
-/// writing every pixel on the single thread driving decompression.
-/// Implemented for the common `Vec<Vec<Pixel>>` row-major storage shape.
+/// Pixel storage backed by one contiguous, row-major buffer. Enables
+/// [`ReadSpecificChannel::collect_pixels_in_parallel`] to hand out disjoint
+/// row ranges to decompression worker threads instead of writing every pixel
+/// on the single thread driving decompression. Contiguity matters: it lets
+/// a worker's row range be obtained by splitting one buffer, rather than by
+/// indexing into a collection of separately heap-allocated rows (as a naive
+/// `Vec<Vec<Pixel>>` would require), which avoids the extra cache/TLB
+/// pressure of several threads concurrently touching scattered allocations.
 #[cfg(feature = "rayon")]
 pub trait RowMajorPixelStorage {
-    /// One row of this storage, as returned by `rows_mut`. Not necessarily
-    /// storing the same type `set_row_pixel` receives -- like `SetPixel` in
-    /// `collect_pixels`, `SetRowPixel` may convert its `Pixel` argument to
-    /// any representation the row's element type needs.
-    type Row;
+    /// The element type stored per pixel slot, as passed to `set_row_pixel`.
+    /// Not necessarily the same type `set_row_pixel` receives as its `Pixel`
+    /// argument -- like `SetPixel` in `collect_pixels`, `set_row_pixel` may
+    /// convert its `Pixel` argument to any representation this element type
+    /// needs.
+    type Element;
 
-    /// Mutable access to every row, in top-to-bottom order, matching the
-    /// image's pixel rows one-to-one.
-    fn rows_mut(&mut self) -> &mut [Self::Row];
+    /// Width of one row, in elements. Must match the image's pixel width.
+    fn width(&self) -> usize;
+
+    /// Mutable access to every pixel as one flat, contiguous, row-major
+    /// buffer (row 0 first, then row 1, and so on), `width() * height`
+    /// elements long.
+    fn pixels_mut(&mut self) -> &mut [Self::Element];
+}
+
+/// The reference [`RowMajorPixelStorage`] implementation: a single flat
+/// `Vec`, addressed row-major with the given `width`.
+#[cfg(feature = "rayon")]
+#[derive(Clone, Debug)]
+pub struct FlatRowMajorPixelStorage<Element> {
+    /// Width of one row, in elements. Must match the image's pixel width.
+    pub width: usize,
+
+    /// All pixels, row-major, `width * height` elements long.
+    pub pixels: Vec<Element>,
 }
 
 #[cfg(feature = "rayon")]
-impl<Element> RowMajorPixelStorage for Vec<Vec<Element>> {
-    type Row = Vec<Element>;
+impl<Element> RowMajorPixelStorage for FlatRowMajorPixelStorage<Element> {
+    type Element = Element;
 
-    fn rows_mut(&mut self) -> &mut [Vec<Element>] {
-        self.as_mut_slice()
+    fn width(&self) -> usize { self.width }
+
+    fn pixels_mut(&mut self) -> &mut [Element] {
+        &mut self.pixels
     }
 }
 
@@ -280,8 +305,8 @@ ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage,
         <InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
         CreatePixels: Fn(Vec2<usize>, &<<InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive) -> PixelStorage,
         PixelStorage: RowMajorPixelStorage,
-        PixelStorage::Row: Send,
-        SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel) + Sync,
+        PixelStorage::Element: Send,
+        SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
         InnerChannels::RecursivePixelReader: Sync,
         Pixel: Send,
 {
@@ -398,8 +423,8 @@ where
     PxReader::RecursivePixel: IntoTuple<Pixel>,
     PxReader::RecursiveChannelDescriptions: IntoNonRecursive,
     PixelStorage: RowMajorPixelStorage,
-    PixelStorage::Row: Send,
-    SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel) + Sync,
+    PixelStorage::Element: Send,
+    SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
     Pixel: Send,
 {
     type Channels = SpecificChannels<
@@ -414,9 +439,9 @@ where
     // Serial fallback, used whenever the caller isn't going through
     // `read_blocks_in_parallel` (e.g. `.non_parallel()` reads). Identical in
     // spirit to `SpecificChannelsReader::read_block`, just addressing
-    // `pixel_storage` through `RowMajorPixelStorage::rows_mut()` and calling
-    // `set_row_pixel(row, x, pixel)` instead of `set_pixel(storage, position,
-    // pixel)`.
+    // `pixel_storage` through `RowMajorPixelStorage::pixels_mut()` (a flat,
+    // row-major buffer) and calling `set_row_pixel(row, x, pixel)` instead of
+    // `set_pixel(storage, position, pixel)`.
     fn read_block(&mut self, header: &Header, block: UncompressedBlock) -> UnitResult {
         let mut pixels = vec![PxReader::RecursivePixel::default(); block.index.pixel_size.width()];
 
@@ -429,10 +454,13 @@ where
             "invalid block lines split"
         );
 
-        let rows = self.pixel_storage.rows_mut();
+        let storage_width = self.pixel_storage.width();
+        let flat = self.pixel_storage.pixels_mut();
+
         for (y_offset, line_bytes) in byte_lines.enumerate() {
             self.pixel_reader.read_pixels(line_bytes, &mut pixels, |px| px);
-            let row = &mut rows[block.index.pixel_position.y() + y_offset];
+            let y = block.index.pixel_position.y() + y_offset;
+            let row = &mut flat[y * storage_width .. (y + 1) * storage_width];
 
             for (x_offset, pixel) in pixels.iter().enumerate() {
                 let set_row_pixel = &self.set_row_pixel;
@@ -494,7 +522,13 @@ where
         let set_row_pixel = &self.set_row_pixel;
         let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
-        let mut rows: &mut [PixelStorage::Row] = self.pixel_storage.rows_mut();
+        // A flat, contiguous buffer (rather than one allocation per row) so
+        // each worker's row range is obtained by splitting this slice
+        // directly -- no per-row indirection, and no threads concurrently
+        // touching scattered, independently heap-allocated rows.
+        let storage_width = self.pixel_storage.width();
+        let mut flat: &mut [PixelStorage::Element] = self.pixel_storage.pixels_mut();
+        let total_rows = if storage_width == 0 { 0 } else { flat.len() / storage_width };
         let mut cursor = 0usize;
 
         pool.scope(|scope| {
@@ -512,14 +546,14 @@ where
                     Err(new_error) => { *error.lock().unwrap() = Some(new_error); break; }
                 };
 
-                if y < cursor || y - cursor > rows.len() || height > rows.len() - (y - cursor) {
+                if y < cursor || y - cursor > total_rows || height > total_rows - (y - cursor) {
                     *error.lock().unwrap() = Some(Error::invalid("chunk row range"));
                     break;
                 }
 
-                let (_, rest) = rows.split_at_mut(y - cursor);
-                let (this_rows, rest) = rest.split_at_mut(height);
-                rows = rest;
+                let (_, rest) = flat.split_at_mut((y - cursor) * storage_width);
+                let (this_elements, rest) = rest.split_at_mut(height * storage_width);
+                flat = rest;
                 cursor = y + height;
 
                 let error = &error;
@@ -532,7 +566,8 @@ where
                                 block.data.chunks_exact(bytes_per_pixel * width).enumerate()
                             {
                                 pixel_reader.read_pixels(line_bytes, &mut pixels, |px| px);
-                                let row = &mut this_rows[y_offset];
+                                let row = &mut this_elements
+                                    [y_offset * storage_width .. (y_offset + 1) * storage_width];
 
                                 for (x_offset, pixel) in pixels.iter().enumerate() {
                                     set_row_pixel(row, x_offset, pixel.into_tuple());

@@ -20,6 +20,22 @@ fn bithash(pixels: &[Vec<[f32; 4]>], mut h: u64) -> u64 {
     h
 }
 
+// Same hash, over a flat row-major buffer instead of `Vec<Vec<_>>`, so
+// `collect_pixels_in_parallel`'s `FlatRowMajorPixelStorage` result is
+// directly comparable to `bithash` above.
+fn bithash_flat(width: usize, pixels: &[[f32; 4]], mut h: u64) -> u64 {
+    for channel_index in 0..3 {
+        for row in pixels.chunks_exact(width) {
+            for pixel in row {
+                let bits = half::f16::from_f32(pixel[channel_index]).to_bits() as u64;
+                h ^=
+                    bits.wrapping_add(0x9e3779b97f4a7c15).wrapping_add(h << 6).wrapping_add(h >> 2);
+            }
+        }
+    }
+    h
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
@@ -45,7 +61,7 @@ fn main() {
     for _ in 0..iters {
         let start = Instant::now();
 
-        let pixels = if parallel_pixels {
+        if parallel_pixels {
             let mut reader = read()
                 .no_deep_data()
                 .largest_resolution_level()
@@ -55,7 +71,10 @@ fn main() {
                 .required("B")
                 .optional("A", 1.0f32)
                 .collect_pixels_in_parallel(
-                    |resolution, _| vec![vec![[0.0f32; 4]; resolution.width()]; resolution.height()],
+                    |resolution, _| FlatRowMajorPixelStorage {
+                        width: resolution.width(),
+                        pixels: vec![[0.0f32; 4]; resolution.width() * resolution.height()],
+                    },
                     |row, x, (r, g, b, a): (f32, f32, f32, f32)| {
                         row[x] = [r, g, b, a];
                     },
@@ -67,7 +86,10 @@ fn main() {
                 reader = reader.non_parallel();
             }
 
-            reader.from_file(path).expect("failed to read exr file").layer_data.channel_data.pixels
+            let pixels =
+                reader.from_file(path).expect("failed to read exr file").layer_data.channel_data.pixels;
+            total += start.elapsed();
+            hash = bithash_flat(pixels.width, &pixels.pixels, hash);
         } else {
             let mut reader = read()
                 .no_deep_data()
@@ -85,11 +107,11 @@ fn main() {
                 reader = reader.non_parallel();
             }
 
-            reader.from_file(path).expect("failed to read exr file").layer_data.channel_data.pixels
+            let pixels =
+                reader.from_file(path).expect("failed to read exr file").layer_data.channel_data.pixels;
+            total += start.elapsed();
+            hash = bithash(&pixels, hash);
         };
-
-        total += start.elapsed();
-        hash = bithash(&pixels, hash);
     }
 
     println!(
