@@ -257,12 +257,56 @@ pub(super) fn write_scanlines_fused(
                 // sample_count`, samples in row-major (y then x) order.
                 let sample_count = width * info.height;
                 let channel_base = rle_cursor[index];
-                let row_sample_base = row * width;
-                for x in 0..width {
-                    let sample = row_sample_base + x;
-                    for byte in 0..bytes_per_sample {
-                        out_row[x * bytes_per_sample + byte] =
-                            rle_planar[channel_base + byte * sample_count + sample];
+                let row_base = channel_base + row * width;
+                // bytes_per_sample is 2 (F16) or 4 (U32/F32) for every RLE
+                // channel the encoder ever produces (see channel_rules.rs).
+                // Unrolling those two cases turns the `byte in
+                // 0..bytes_per_sample` loop; 2 iterations of real work
+                // dominated by its own branch/counter overhead, per a perf
+                // profile -- into straight-line code the compiler can pipeline.
+                // Iterate via `.zip()` over equal-length slices rather than
+                // indexing by `x`; lets the compiler prove every access is
+                // in-bounds and drop the per-element bounds check, which a
+                // perf profile showed dominating this loop's cost (the loop
+                // body is only a byte load + store, so a compare+branch pair
+                // per element roughly doubled the work).
+                match bytes_per_sample {
+                    2 => {
+                        let plane0 = &rle_planar[row_base..row_base + width];
+                        let plane1 = &rle_planar
+                            [row_base + sample_count..row_base + sample_count + width];
+                        for (out_pair, (&b0, &b1)) in
+                            out_row.chunks_exact_mut(2).zip(plane0.iter().zip(plane1))
+                        {
+                            out_pair[0] = b0;
+                            out_pair[1] = b1;
+                        }
+                    }
+                    4 => {
+                        let plane0 = &rle_planar[row_base..row_base + width];
+                        let plane1 = &rle_planar
+                            [row_base + sample_count..row_base + sample_count + width];
+                        let plane2 = &rle_planar[row_base + 2 * sample_count
+                            ..row_base + 2 * sample_count + width];
+                        let plane3 = &rle_planar[row_base + 3 * sample_count
+                            ..row_base + 3 * sample_count + width];
+                        for (out_quad, (((&b0, &b1), &b2), &b3)) in out_row
+                            .chunks_exact_mut(4)
+                            .zip(plane0.iter().zip(plane1).zip(plane2).zip(plane3))
+                        {
+                            out_quad[0] = b0;
+                            out_quad[1] = b1;
+                            out_quad[2] = b2;
+                            out_quad[3] = b3;
+                        }
+                    }
+                    _ => {
+                        for x in 0..width {
+                            for byte in 0..bytes_per_sample {
+                                out_row[x * bytes_per_sample + byte] =
+                                    rle_planar[row_base + byte * sample_count + x];
+                            }
+                        }
                     }
                 }
             }
