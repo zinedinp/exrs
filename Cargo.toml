@@ -37,8 +37,6 @@ pulp = "0.22.3"                # used for runtime SIMD dispatch
 num-complex = "0.4.6"          # pins pulps own dependency, pulp wants 0.4.4 but calls for Complex::ZERO/ONE/I; consts added in 0.4.6
 
 [dev-dependencies]
-image = { version = "0.25.2", default-features = false, features = ["png"] }         # used to convert one exr to some pngs
-
 bencher = "0.1.5"
 walkdir = "2.3.2"         # automatically test things for all files in a directory
 rand = "0.10.2"            # used for fuzz testing
