@@ -95,9 +95,47 @@ fn separate_byte_planes(interleaved: &[u8], bytes_per_sample: usize) -> Vec<u8> 
     let sample_count = interleaved.len() / bytes_per_sample;
     let mut planar = vec![0u8; interleaved.len()];
 
-    for byte in 0..bytes_per_sample {
-        for sample in 0..sample_count {
-            planar[byte * sample_count + sample] = interleaved[sample * bytes_per_sample + byte];
+    // bytes_per_sample is 2 (F16) or 4 (U32/F32) for every RLE channel the
+    // encoder ever produces (see channel_rules.rs). Iterating via
+    // `.chunks_exact()`/`.iter_mut()` over equal-length slices instead of
+    // indexing by `sample` lets the compiler prove every access is in-bounds
+    // and drop the per-element bounds check; mirrors the fix
+    // for the decode-side interleave direction in
+    // `write_scanlines_fused`.
+    match bytes_per_sample {
+        2 => {
+            let (plane0, plane1) = planar.split_at_mut(sample_count);
+            for (chunk, (p0, p1)) in
+                interleaved.chunks_exact(2).zip(plane0.iter_mut().zip(plane1.iter_mut()))
+            {
+                *p0 = chunk[0];
+                *p1 = chunk[1];
+            }
+        }
+        4 => {
+            let (plane0, rest) = planar.split_at_mut(sample_count);
+            let (plane1, rest) = rest.split_at_mut(sample_count);
+            let (plane2, plane3) = rest.split_at_mut(sample_count);
+            for (chunk, (((p0, p1), p2), p3)) in interleaved.chunks_exact(4).zip(
+                plane0
+                    .iter_mut()
+                    .zip(plane1.iter_mut())
+                    .zip(plane2.iter_mut())
+                    .zip(plane3.iter_mut()),
+            ) {
+                *p0 = chunk[0];
+                *p1 = chunk[1];
+                *p2 = chunk[2];
+                *p3 = chunk[3];
+            }
+        }
+        _ => {
+            for byte in 0..bytes_per_sample {
+                for sample in 0..sample_count {
+                    planar[byte * sample_count + sample] =
+                        interleaved[sample * bytes_per_sample + byte];
+                }
+            }
         }
     }
 
