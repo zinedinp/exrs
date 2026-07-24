@@ -98,6 +98,65 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
             px: Default::default(),
         }
     }
+
+    /// Like `collect_pixels`, but writes pixels directly from decompression
+    /// worker threads when reading with multiple threads (the default,
+    /// unless `.non_parallel()` is used), instead of `collect_pixels`'
+    /// single-threaded pixel-storage conversion. Can give a substantial
+    /// speedup on multi-core machines, at the cost of a different
+    /// `set_row_pixel` closure signature: it receives one row of the pixel
+    /// storage plus an `x` index, rather than the whole storage plus a
+    /// `Vec2` position, since concurrent workers only ever get access to
+    /// their own disjoint row range. Requires `PixelStorage` to implement
+    /// [`RowMajorPixelStorage`] (implemented for `Vec<Vec<Pixel>>`).
+    #[cfg(feature = "rayon")]
+    fn collect_pixels_in_parallel<Pixel, PixelStorage, CreatePixels, SetRowPixel>(
+        self, create_pixels: CreatePixels, set_row_pixel: SetRowPixel
+    ) -> CollectPixelsInParallel<Self, Pixel, PixelStorage, CreatePixels, SetRowPixel>
+        where
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
+            CreatePixels: Fn(
+                Vec2<usize>,
+                &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
+            ) -> PixelStorage,
+            PixelStorage: RowMajorPixelStorage,
+            SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel),
+    {
+        CollectPixelsInParallel {
+            read_channels: self,
+            set_row_pixel,
+            create_pixels,
+            px: Default::default(),
+        }
+    }
+}
+
+/// Pixel storage whose rows can be accessed and mutated independently of one
+/// another. Enables [`ReadSpecificChannel::collect_pixels_in_parallel`] to
+/// hand out disjoint row ranges to decompression worker threads instead of
+/// writing every pixel on the single thread driving decompression.
+/// Implemented for the common `Vec<Vec<Pixel>>` row-major storage shape.
+#[cfg(feature = "rayon")]
+pub trait RowMajorPixelStorage {
+    /// One row of this storage, as returned by `rows_mut`. Not necessarily
+    /// storing the same type `set_row_pixel` receives -- like `SetPixel` in
+    /// `collect_pixels`, `SetRowPixel` may convert its `Pixel` argument to
+    /// any representation the row's element type needs.
+    type Row;
+
+    /// Mutable access to every row, in top-to-bottom order, matching the
+    /// image's pixel rows one-to-one.
+    fn rows_mut(&mut self) -> &mut [Self::Row];
+}
+
+#[cfg(feature = "rayon")]
+impl<Element> RowMajorPixelStorage for Vec<Vec<Element>> {
+    type Row = Vec<Element>;
+
+    fn rows_mut(&mut self) -> &mut [Vec<Element>] {
+        self.as_mut_slice()
+    }
 }
 
 /// A reader containing sub-readers for reading the pixel content of an image.
@@ -154,6 +213,19 @@ pub struct CollectPixels<ReadChannels, Pixel, PixelStorage, CreatePixels, SetPix
     px: PhantomData<(Pixel, PixelStorage)>,
 }
 
+/// Like `CollectPixels`, but for `collect_pixels_in_parallel`: pixels are
+/// written via `set_row_pixel(row, x, pixel)` instead of `set_pixel(storage,
+/// position, pixel)`, so worker threads only ever need access to their own
+/// disjoint row range.
+#[cfg(feature = "rayon")]
+#[derive(Copy, Clone, Debug)]
+pub struct CollectPixelsInParallel<ReadChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel> {
+    read_channels: ReadChannels,
+    create_pixels: CreatePixels,
+    set_row_pixel: SetRowPixel,
+    px: PhantomData<(Pixel, PixelStorage)>,
+}
+
 impl<Inner: CheckDuplicates, Sample> CheckDuplicates for ReadRequiredChannel<Inner, Sample> {
     fn already_contains(&self, name: &Text) -> bool {
         &self.channel_name == name || self.previous_channels.already_contains(name)
@@ -192,6 +264,44 @@ ReadChannels<'s> for CollectPixels<InnerChannels, Pixel, PixelStorage, CreatePix
 
         Ok(SpecificChannelsReader {
             set_pixel: &self.set_pixel,
+            pixel_storage,
+            pixel_reader,
+            px: Default::default()
+        })
+    }
+}
+
+#[cfg(feature = "rayon")]
+impl<'s, InnerChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel: 's>
+ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel>
+    where
+        InnerChannels: ReadSpecificChannel,
+        <InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
+        <InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
+        CreatePixels: Fn(Vec2<usize>, &<<InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive) -> PixelStorage,
+        PixelStorage: RowMajorPixelStorage,
+        PixelStorage::Row: Send,
+        SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel) + Sync,
+        InnerChannels::RecursivePixelReader: Sync,
+        Pixel: Send,
+{
+    type Reader = SpecificChannelsParallelReader<
+        PixelStorage, &'s SetRowPixel,
+        InnerChannels::RecursivePixelReader,
+        Pixel,
+    >;
+
+    fn create_channels_reader(&'s self, header: &Header) -> Result<Self::Reader> {
+        if header.deep { return Err(Error::invalid("`SpecificChannels` does not support deep data yet")) }
+
+        let pixel_reader = self.read_channels.create_recursive_reader(&header.channels)?;
+        let channel_descriptions = pixel_reader.get_descriptions().into_non_recursive();
+
+        let create = &self.create_pixels;
+        let pixel_storage = create(header.layer_size, &channel_descriptions);
+
+        Ok(SpecificChannelsParallelReader {
+            set_row_pixel: &self.set_row_pixel,
             pixel_storage,
             pixel_reader,
             px: Default::default()
@@ -263,6 +373,185 @@ where
         SpecificChannels {
             channels: self.pixel_reader.get_descriptions().into_non_recursive(),
             pixels: self.pixel_storage,
+        }
+    }
+}
+
+/// Like `SpecificChannelsReader`, but for `collect_pixels_in_parallel`: able
+/// to write pixels directly from decompression worker threads, since
+/// `PixelStorage: RowMajorPixelStorage` lets its rows be split into
+/// disjoint, independently-writable ranges.
+#[cfg(feature = "rayon")]
+#[derive(Copy, Clone, Debug)]
+pub struct SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PixelReader, Pixel> {
+    set_row_pixel: SetRowPixel,
+    pixel_storage: PixelStorage,
+    pixel_reader: PixelReader,
+    px: PhantomData<Pixel>,
+}
+
+#[cfg(feature = "rayon")]
+impl<PixelStorage, SetRowPixel, PxReader, Pixel> ChannelsReader
+    for SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PxReader, Pixel>
+where
+    PxReader: RecursivePixelReader + Sync,
+    PxReader::RecursivePixel: IntoTuple<Pixel>,
+    PxReader::RecursiveChannelDescriptions: IntoNonRecursive,
+    PixelStorage: RowMajorPixelStorage,
+    PixelStorage::Row: Send,
+    SetRowPixel: Fn(&mut PixelStorage::Row, usize, Pixel) + Sync,
+    Pixel: Send,
+{
+    type Channels = SpecificChannels<
+        PixelStorage,
+        <PxReader::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive,
+    >;
+
+    fn filter_block(&self, tile: TileCoordinates) -> bool {
+        tile.is_largest_resolution_level()
+    }
+
+    // Serial fallback, used whenever the caller isn't going through
+    // `read_blocks_in_parallel` (e.g. `.non_parallel()` reads). Identical in
+    // spirit to `SpecificChannelsReader::read_block`, just addressing
+    // `pixel_storage` through `RowMajorPixelStorage::rows_mut()` and calling
+    // `set_row_pixel(row, x, pixel)` instead of `set_pixel(storage, position,
+    // pixel)`.
+    fn read_block(&mut self, header: &Header, block: UncompressedBlock) -> UnitResult {
+        let mut pixels = vec![PxReader::RecursivePixel::default(); block.index.pixel_size.width()];
+
+        let byte_lines = block
+            .data
+            .chunks_exact(header.channels.bytes_per_pixel * block.index.pixel_size.width());
+        debug_assert_eq!(
+            byte_lines.len(),
+            block.index.pixel_size.height(),
+            "invalid block lines split"
+        );
+
+        let rows = self.pixel_storage.rows_mut();
+        for (y_offset, line_bytes) in byte_lines.enumerate() {
+            self.pixel_reader.read_pixels(line_bytes, &mut pixels, |px| px);
+            let row = &mut rows[block.index.pixel_position.y() + y_offset];
+
+            for (x_offset, pixel) in pixels.iter().enumerate() {
+                let set_row_pixel = &self.set_row_pixel;
+                set_row_pixel(row, block.index.pixel_position.x() + x_offset, pixel.into_tuple());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn into_channels(self) -> Self::Channels {
+        SpecificChannels {
+            channels: self.pixel_reader.get_descriptions().into_non_recursive(),
+            pixels: self.pixel_storage,
+        }
+    }
+
+    fn supports_parallel_write(&self) -> bool {
+        true
+    }
+
+    // Reads and decompresses every remaining chunk using `pool`, writing
+    // each block's converted pixels directly from the worker that
+    // decompressed it -- instead of decompressing in parallel but converting
+    // serially on the driving thread, as the plain `read_block` loop does.
+    //
+    // Each chunk is dispatched to a worker as soon as it's read (its row
+    // range is cheap to look up -- header math on data `chunks.next()`
+    // already read, no decompression needed), so reading later chunks
+    // overlaps with decompressing earlier ones, same as `decompress_parallel`.
+    // This requires chunks to arrive in increasing-row order to hand out
+    // disjoint `split_at_mut` slices with a single forward-moving cursor --
+    // true for `LineOrder::Increasing` and, by convention, `Unspecified`
+    // (see `LineOrder`'s docs). `LineOrder::Decreasing` files fall back to a
+    // serial decode here (rare in practice; still correct, just not
+    // parallel), rather than buffering every chunk's compressed bytes
+    // in memory up front to sort by row, which would give up the
+    // read/decompress overlap for every file to support an uncommon case.
+    fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        header: &Header,
+        mut chunks: R,
+        meta_data: &crate::meta::MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        let width = header.layer_size.width();
+        let bytes_per_pixel = header.channels.bytes_per_pixel;
+
+        if header.line_order == crate::meta::attribute::LineOrder::Decreasing {
+            while let Some(chunk) = chunks.next() {
+                let block = UncompressedBlock::decompress_chunk(chunk?, meta_data, pedantic)?;
+                self.read_block(header, block)?;
+            }
+            return Ok(());
+        }
+
+        let pixel_reader = &self.pixel_reader;
+        let set_row_pixel = &self.set_row_pixel;
+        let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+
+        let mut rows: &mut [PixelStorage::Row] = self.pixel_storage.rows_mut();
+        let mut cursor = 0usize;
+
+        pool.scope(|scope| {
+            while let Some(chunk) = chunks.next() {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(new_error) => { *error.lock().unwrap() = Some(new_error); break; }
+                };
+
+                let (y, height) = match header
+                    .get_block_data_indices(&chunk.compressed_block)
+                    .and_then(|tile| header.get_absolute_block_pixel_coordinates(tile))
+                {
+                    Ok(indices) => (indices.position.y() as usize, indices.size.height()),
+                    Err(new_error) => { *error.lock().unwrap() = Some(new_error); break; }
+                };
+
+                if y < cursor || y - cursor > rows.len() || height > rows.len() - (y - cursor) {
+                    *error.lock().unwrap() = Some(Error::invalid("chunk row range"));
+                    break;
+                }
+
+                let (_, rest) = rows.split_at_mut(y - cursor);
+                let (this_rows, rest) = rest.split_at_mut(height);
+                rows = rest;
+                cursor = y + height;
+
+                let error = &error;
+                scope.spawn(move |_| {
+                    let result = UncompressedBlock::decompress_chunk(chunk, meta_data, pedantic)
+                        .and_then(|block| {
+                            let mut pixels = vec![PxReader::RecursivePixel::default(); width];
+
+                            for (y_offset, line_bytes) in
+                                block.data.chunks_exact(bytes_per_pixel * width).enumerate()
+                            {
+                                pixel_reader.read_pixels(line_bytes, &mut pixels, |px| px);
+                                let row = &mut this_rows[y_offset];
+
+                                for (x_offset, pixel) in pixels.iter().enumerate() {
+                                    set_row_pixel(row, x_offset, pixel.into_tuple());
+                                }
+                            }
+
+                            Ok(())
+                        });
+
+                    if let Err(new_error) = result {
+                        *error.lock().unwrap() = Some(new_error);
+                    }
+                });
+            }
+        });
+
+        match error.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }

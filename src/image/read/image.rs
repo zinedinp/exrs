@@ -30,7 +30,7 @@ pub struct ReadImage<OnProgress, ReadLayers> {
 
 impl<F, L> ReadImage<F, L>
 where
-    F: FnMut(f64),
+    F: FnMut(f64) + Send,
 {
     /// Uses relaxed error handling and parallel decompression.
     pub fn new(read_layers: L, on_progress: F) -> Self {
@@ -111,7 +111,7 @@ where
     /// have a file path.
     #[inline]
     #[must_use]
-    pub fn from_unbuffered<Layers>(self, unbuffered: impl Read + Seek) -> Result<Image<Layers>>
+    pub fn from_unbuffered<Layers>(self, unbuffered: impl Read + Seek + Send) -> Result<Image<Layers>>
     where
         for<'s> L: ReadLayers<'s, Layers = Layers>,
     {
@@ -122,10 +122,8 @@ where
     /// Use [`ReadImage::read_from_file`] instead, if you have a file path.
     /// Use [`ReadImage::read_from_unbuffered`] instead, if this is not an
     /// in-memory reader.
-    // TODO Use Parallel<> Wrapper to only require sendable byte source where parallel decompression
-    // is required
     #[must_use]
-    pub fn from_buffered<Layers>(self, buffered: impl Read + Seek) -> Result<Image<Layers>>
+    pub fn from_buffered<Layers>(self, buffered: impl Read + Seek + Send) -> Result<Image<Layers>>
     where
         for<'s> L: ReadLayers<'s, Layers = Layers>,
     {
@@ -138,12 +136,14 @@ where
     /// Use [`ReadImage::read_from_file`] instead, if you have a file path.
     /// Use [`ReadImage::read_from_buffered`] instead, if this is an in-memory
     /// reader.
-    // TODO Use Parallel<> Wrapper to only require sendable byte source where parallel decompression
-    // is required
+    // The byte source must be `Send`: `collect_pixels_in_parallel` reads
+    // chunks (which borrows the source) from inside a `rayon::Scope`, whose
+    // entry closure rayon requires to be `Send` even though it runs
+    // synchronously on the calling thread here.
     #[must_use]
     pub fn from_chunks<Layers>(
         mut self,
-        chunks_reader: crate::block::reader::Reader<impl Read + Seek>,
+        chunks_reader: crate::block::reader::Reader<impl Read + Seek + Send>,
     ) -> Result<Image<Layers>>
     where
         for<'s> L: ReadLayers<'s, Layers = Layers>,
@@ -173,9 +173,38 @@ where
             ));
 
             #[cfg(feature = "rayon")]
-            block_reader.decompress_parallel(pedantic, |meta_data, block| {
-                image_collector.read_block(&meta_data.headers, block)
-            })?;
+            {
+                // When the reader supports it (currently: single-layer
+                // `SpecificChannels` reads via `collect_pixels_in_parallel`),
+                // convert pixels directly from the decompression worker
+                // threads instead of decompressing in parallel but
+                // converting serially on the driving thread -- see
+                // `ChannelsReader::supports_parallel_write`.
+                let pool = image_collector.supports_parallel_write().then(|| {
+                    rayon_core::ThreadPoolBuilder::new()
+                        .thread_name(|index| format!("OpenEXR Block Decompressor Thread #{index}"))
+                        .build()
+                        .ok()
+                }).flatten();
+
+                match pool {
+                    Some(pool) => {
+                        let meta_data = block_reader.meta_data().clone();
+                        image_collector.read_blocks_in_parallel(
+                            &meta_data.headers,
+                            block_reader,
+                            &meta_data,
+                            &pool,
+                            pedantic,
+                        )?;
+                    }
+                    None => {
+                        block_reader.decompress_parallel(pedantic, |meta_data, block| {
+                            image_collector.read_block(&meta_data.headers, block)
+                        })?;
+                    }
+                }
+            }
         } else {
             block_reader.decompress_sequential(pedantic, |meta_data, block| {
                 image_collector.read_block(&meta_data.headers, block)
@@ -219,6 +248,23 @@ where
     /// accumulating the image
     fn read_block(&mut self, headers: &[Header], block: UncompressedBlock) -> UnitResult {
         self.layers_reader.read_block(headers, block)
+    }
+
+    #[cfg(feature = "rayon")]
+    fn supports_parallel_write(&self) -> bool {
+        self.layers_reader.supports_parallel_write()
+    }
+
+    #[cfg(feature = "rayon")]
+    fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        headers: &[Header],
+        chunks: R,
+        meta_data: &MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        self.layers_reader.read_blocks_in_parallel(headers, chunks, meta_data, pool, pedantic)
     }
 
     /// Deliver the complete accumulated image
@@ -267,4 +313,32 @@ pub trait LayersReader {
 
     /// Deliver the final accumulated layers for the image
     fn into_layers(self) -> Self::Layers;
+
+    /// See `ChannelsReader::supports_parallel_write`. Default `false`:
+    /// falls back to the existing `read_block`-per-completed-block loop.
+    /// Overridden by `FirstValidLayerReader` when its inner channels reader
+    /// supports it; multi-layer reads (`AllLayersReader`) always use the
+    /// serial fallback, since blocks from a shared chunk stream can belong
+    /// to any of several independently-sized layers.
+    #[cfg(feature = "rayon")]
+    fn supports_parallel_write(&self) -> bool {
+        false
+    }
+
+    /// Only called when `supports_parallel_write()` returns `true`. See
+    /// `ChannelsReader::read_blocks_in_parallel`.
+    #[cfg(feature = "rayon")]
+    fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        headers: &[Header],
+        chunks: R,
+        meta_data: &MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        let _ = (headers, chunks, meta_data, pool, pedantic);
+        unreachable!(
+            "read_blocks_in_parallel called without supports_parallel_write() == true"
+        )
+    }
 }
