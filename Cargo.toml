@@ -62,6 +62,12 @@ sse2-tests = []
 # `cargo bench --features simd-benches --bench dct`
 simd-benches = []
 
+# Per-stage wall-clock timing of the DWA decode pipeline (unknown/AC/DC/RLE
+# section decode, lossy DCT decode, final scanline assembly), accumulated in
+# global atomics and printed by examples/dwa_bench.rs. Adds a few atomic
+# adds per chunk; negligible unless you're doing this exact measurement.
+dwa-profile = []
+
 [[example]]
 name = "7_write_raw_blocks"
 required-features = ["rayon"]

@@ -34,6 +34,9 @@ fn main() {
     let mut total = std::time::Duration::ZERO;
     let mut hash = 0u64;
 
+    #[cfg(feature = "dwa-profile")]
+    exr::compression::dwa::profile::reset();
+
     for _ in 0..iters {
         let start = Instant::now();
 
@@ -67,4 +70,7 @@ fn main() {
         total.as_secs_f64() * 1000.0 / iters as f64,
         hash
     );
+
+    #[cfg(feature = "dwa-profile")]
+    exr::compression::dwa::profile::report(iters as u64);
 }

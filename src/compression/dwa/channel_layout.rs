@@ -2,14 +2,13 @@
 // scanline buffer the rest of the crate uses, the per-channel byte runs, the
 // planar byte planes of the UNKNOWN/RLE sections, and back again.
 
-use half::f16;
-
 use super::{ChannelInfo, CompressorScheme};
 use crate::{
-    compression::ByteVec,
     error::{Error, Result},
-    meta::attribute::{ChannelList, IntegerBounds, SampleType},
+    meta::attribute::{ChannelList, IntegerBounds},
 };
+#[cfg(test)]
+use crate::meta::attribute::SampleType;
 
 pub(super) fn split_scanline_channels(
     data: &[u8],
@@ -150,21 +149,21 @@ pub(super) fn interleave_byte_planes(planar: &[u8], bytes_per_sample: usize) -> 
     interleaved
 }
 
-/// Interleave the per-channel decoded data into the scanline layout the
-/// rest of exrs expects: rows of "y" ascending, channels in list order
-/// within each row, samples little-endian.
-pub(super) fn write_scanlines(
+/// Byte offset, for each channel and each of its local (subsampling-adjusted)
+/// rows, into the final scanline-interleaved output buffer: rows of "y"
+/// ascending, channels in list order within each row, samples little-endian.
+/// Shared by the lossy DCT decode path (which writes its output directly at
+/// these offsets, avoiding an intermediate per-channel buffer + copy) and
+/// `write_scanlines` below (which still copies UNKNOWN/RLE planar data, since
+/// those need a layout transform decode_lossy_dct_group doesn't).
+pub(super) fn compute_row_offsets(
     channels: &ChannelList,
     infos: &[ChannelInfo],
     rectangle: IntegerBounds,
-    lossy_samples: &[Vec<f16>],
-    unknown_bytes: &[Vec<u8>],
-    rle_bytes: &[Vec<u8>],
-    expected_byte_size: usize,
-) -> Result<ByteVec> {
-    // Reassemble the per-channel decoded data into the scanline layout the
-    // rest of the crate expects: rows in ascending y, channels in list order.
-    let mut out = Vec::with_capacity(expected_byte_size);
+) -> Vec<Vec<usize>> {
+    let mut offsets: Vec<Vec<usize>> =
+        infos.iter().map(|info| vec![0usize; info.height]).collect();
+    let mut cursor = 0usize;
 
     for y in rectangle.position.y()..rectangle.end().y() {
         for (index, channel) in channels.list.iter().enumerate() {
@@ -175,47 +174,48 @@ pub(super) fn write_scanlines(
 
             let info = &infos[index];
             let row = ((y - rectangle.position.y()) / sampling_y) as usize;
-
-            match info.scheme {
-                CompressorScheme::LossyDct => {
-                    let row_samples = &lossy_samples[index][row * info.width..][..info.width];
-                    match info.sample_type {
-                        SampleType::F16 => {
-                            for sample in row_samples {
-                                out.extend_from_slice(&sample.to_bits().to_le_bytes());
-                            }
-                        }
-                        SampleType::F32 => {
-                            for sample in row_samples {
-                                out.extend_from_slice(&sample.to_f32().to_le_bytes());
-                            }
-                        }
-                        // rejected before decoding
-                        SampleType::U32 => {
-                            return Err(Error::unsupported(
-                                "DWA lossy DCT compression of u32 channels",
-                            ));
-                        }
-                    }
-                }
-
-                CompressorScheme::Unknown | CompressorScheme::Rle => {
-                    let bytes = if info.scheme == CompressorScheme::Unknown {
-                        &unknown_bytes[index]
-                    } else {
-                        &rle_bytes[index]
-                    };
-                    let row_length = info.width * info.bytes_per_sample;
-                    out.extend_from_slice(&bytes[row * row_length..][..row_length]);
-                }
-            }
+            offsets[index][row] = cursor;
+            cursor += info.width * info.bytes_per_sample;
         }
     }
 
-    if out.len() != expected_byte_size {
-        return Err(Error::invalid("DWA decoded size mismatch"));
+    offsets
+}
+
+/// Copy the UNKNOWN/RLE planar decode results into the scanline layout the
+/// rest of exrs expects, at the offsets `compute_row_offsets` assigned them.
+/// LossyDct channels are skipped: the lossy DCT decode already wrote them
+/// directly into `out` at the same offsets.
+pub(super) fn write_scanlines(
+    channels: &ChannelList,
+    infos: &[ChannelInfo],
+    rectangle: IntegerBounds,
+    row_offsets: &[Vec<usize>],
+    unknown_bytes: &[Vec<u8>],
+    rle_bytes: &[Vec<u8>],
+    out: &mut [u8],
+) {
+    for y in rectangle.position.y()..rectangle.end().y() {
+        for (index, channel) in channels.list.iter().enumerate() {
+            let sampling_y = channel.sampling.y().max(1) as i32;
+            if y % sampling_y != 0 {
+                continue;
+            }
+
+            let info = &infos[index];
+            if info.scheme == CompressorScheme::LossyDct {
+                continue;
+            }
+
+            let row = ((y - rectangle.position.y()) / sampling_y) as usize;
+            let offset = row_offsets[index][row];
+            let row_length = info.width * info.bytes_per_sample;
+
+            let bytes =
+                if info.scheme == CompressorScheme::Unknown { &unknown_bytes[index] } else { &rle_bytes[index] };
+            out[offset..offset + row_length].copy_from_slice(&bytes[row * row_length..][..row_length]);
+        }
     }
-    Ok(out)
 }
 
 #[cfg(test)]

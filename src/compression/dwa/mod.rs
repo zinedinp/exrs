@@ -34,9 +34,14 @@ pub mod discrete_cosine_transform;
 #[cfg(test)]
 mod tests;
 
+// public only for the dwa_bench example
+#[doc(hidden)]
+#[cfg(feature = "dwa-profile")]
+pub mod profile;
+
 use channel_layout::{
-    interleave_byte_planes, pack_rle_channels, pack_unknown_channels, split_planar_channels,
-    split_scanline_channels, u16s_to_le_bytes, write_scanlines,
+    compute_row_offsets, interleave_byte_planes, pack_rle_channels, pack_unknown_channels,
+    split_planar_channels, split_scanline_channels, u16s_to_le_bytes, write_scanlines,
 };
 use channel_rules::{
     default_channel_rules, legacy_channel_rules, parse_channel_rules, write_relevant_channel_rules,
@@ -270,11 +275,48 @@ pub fn decompress(
 
     let [unknown_section, ac_section, dc_section, rle_section] = split_sections(input, &header)?;
 
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
     let unknown_planar = decode_unknown_section(unknown_section, &header)?;
-    let ac_packed = decode_ac_section(ac_section, &header)?;
-    let dc_packed = decode_dc_section(dc_section, &header)?;
-    let rle_planar = decode_rle_section(rle_section, &header)?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::UNKNOWN_NS);
 
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
+    let ac_packed = decode_ac_section(ac_section, &header)?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::AC_NS);
+
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
+    let dc_packed = decode_dc_section(dc_section, &header)?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::DC_NS);
+
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
+    let rle_planar = decode_rle_section(rle_section, &header)?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::RLE_NS);
+
+    let row_offsets = compute_row_offsets(channels, &channel_infos, rectangle);
+    let mut out = vec![0u8; expected_byte_size];
+
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
+    decode_lossy_channels(
+        &channel_infos,
+        &csc_groups,
+        &ac_packed,
+        &dc_packed,
+        &row_offsets,
+        &mut out,
+    )?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::DCT_NS);
+
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
     let unknown_bytes =
         split_planar_channels(&channel_infos, CompressorScheme::Unknown, &unknown_planar)?;
     let rle_bytes: Vec<Vec<u8>> =
@@ -284,17 +326,9 @@ pub fn decompress(
             .map(|(planar, info)| interleave_byte_planes(&planar, info.bytes_per_sample))
             .collect();
 
-    let lossy_samples = decode_lossy_channels(&channel_infos, &csc_groups, &ac_packed, &dc_packed)?;
-
-    let out = write_scanlines(
-        channels,
-        &channel_infos,
-        rectangle,
-        &lossy_samples,
-        &unknown_bytes,
-        &rle_bytes,
-        expected_byte_size,
-    )?;
+    write_scanlines(channels, &channel_infos, rectangle, &row_offsets, &unknown_bytes, &rle_bytes, &mut out);
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&profile::ASSEMBLE_NS);
 
     crate::compression::convert_little_endian_to_current(out, channels, rectangle)
 }

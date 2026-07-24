@@ -266,28 +266,42 @@ impl<'v> PackedStream<'v> {
     }
 }
 
-/// Decode all LOSSY_DCT channels: first every CSC group, then the
-/// standalone channels, both in channel order - the order in which the
-/// encoder appended them to the shared AC/DC streams.
+/// Where one channel's decoded lossy DCT output should land in the final
+/// scanline-interleaved output buffer: its sample type (for serialization)
+/// and, per local row, the byte offset `compute_row_offsets` assigned it.
+/// Writing straight here instead of into an intermediate per-channel buffer
+/// avoids a second full-image copy pass (the equivalent of OpenEXR C++'s
+/// `LossyDctDecoder_execute` writing directly into its output rows).
+pub(super) struct ScanlineTarget<'a> {
+    pub(super) sample_type: SampleType,
+    pub(super) row_offsets: &'a [usize],
+}
+
+/// Decode all LOSSY_DCT channels directly into `out`: first every CSC group,
+/// then the standalone channels, both in channel order - the order in which
+/// the encoder appended them to the shared AC/DC streams.
 pub(super) fn decode_lossy_channels(
     infos: &[ChannelInfo],
     csc_groups: &[[usize; 3]],
     ac_packed: &[u16],
     dc_packed: &[u16],
-) -> Result<Vec<Vec<f16>>> {
+    row_offsets: &[Vec<usize>],
+    out: &mut [u8],
+) -> Result<()> {
     // Decode CSC triplets first, then standalone lossy channels. The shared
     // AC/DC cursors advance in the same order the encoder wrote them.
     let mut ac = PackedStream::new(ac_packed);
     let mut dc = PackedStream::new(dc_packed);
 
-    let mut samples: Vec<Vec<f16>> = vec![vec![]; infos.len()];
     let mut grouped = vec![false; infos.len()];
 
     for &group in csc_groups {
         // all three channels have identical sampling, hence identical size
         let info = &infos[group[0]];
-        let mut decoded: [Vec<f16>; 3] =
-            std::array::from_fn(|_| vec![f16::ZERO; info.width * info.height]);
+        let mut targets: [ScanlineTarget<'_>; 3] = std::array::from_fn(|i| {
+            let channel = group[i];
+            ScanlineTarget { sample_type: infos[channel].sample_type, row_offsets: &row_offsets[channel] }
+        });
 
         decode_lossy_dct_group(
             &mut ac,
@@ -295,11 +309,11 @@ pub(super) fn decode_lossy_channels(
             info.width,
             info.height,
             Some(to_linear_table()),
-            &mut decoded,
+            &mut targets,
+            out,
         )?;
 
-        for (&channel, channel_samples) in group.iter().zip(decoded) {
-            samples[channel] = channel_samples;
+        for &channel in &group {
             grouped[channel] = true;
         }
     }
@@ -308,29 +322,29 @@ pub(super) fn decode_lossy_channels(
         if grouped[index] || info.scheme != CompressorScheme::LossyDct {
             continue;
         }
-        let mut decoded = [vec![f16::ZERO; info.width * info.height]];
+        let mut targets =
+            [ScanlineTarget { sample_type: info.sample_type, row_offsets: &row_offsets[index] }];
         let to_linear = (!info.quantize_linearly).then(to_linear_table);
-        decode_lossy_dct_group(&mut ac, &mut dc, info.width, info.height, to_linear, &mut decoded)?;
-
-        let [channel_samples] = decoded;
-        samples[index] = channel_samples;
+        decode_lossy_dct_group(&mut ac, &mut dc, info.width, info.height, to_linear, &mut targets, out)?;
     }
 
-    Ok(samples)
+    Ok(())
 }
 
-/// Decode one standalone channel (decoded.len() == 1) or one CSC'd R/G/B
-/// triplet (decoded.len() == 3): per 8x8 block and component, read the
-/// DC value, un-RLE the AC values, inverse-DCT
+/// Decode one standalone channel (targets.len() == 1) or one CSC'd R/G/B
+/// triplet (targets.len() == 3): per 8x8 block and component, read the
+/// DC value, un-RLE the AC values, inverse-DCT, and write straight into the
+/// final output buffer at each target's precomputed row offsets.
 fn decode_lossy_dct_group(
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     width: usize,
     height: usize,
     to_linear: Option<&[u16; 65536]>,
-    decoded: &mut [Vec<f16>],
+    targets: &mut [ScanlineTarget<'_>],
+    out: &mut [u8],
 ) -> Result<()> {
-    let components = decoded.len();
+    let components = targets.len();
     let blocks_x = (width + 7) / 8;
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
@@ -415,35 +429,59 @@ fn decode_lossy_dct_group(
                 let base = (row_in_strip * blocks_x + block_x) * components;
                 let x_count = 8.min(width - block_x * 8);
 
-                // Convert nonlinear DCT output back to linear half values and crop
-                // the edges to the actual image extent. `to_linear` is the same
-                // for the whole call, so match it once per block/component here
-                // instead of once per pixel, and slice each 8-wide block row once
-                // instead of re-deriving its offset for every pixel.
-                for (component, output) in decoded.iter_mut().enumerate() {
+                // Convert nonlinear DCT output back to linear half values, crop
+                // the edges to the actual image extent, and serialize straight
+                // into the final scanline buffer at this target's row offsets
+                // (no intermediate per-channel buffer + later copy, mirroring
+                // OpenEXR C++'s LossyDctDecoder_execute writing directly into
+                // its output rows). `to_linear` and the sample type are the
+                // same for the whole call, so match them once per
+                // block/component here instead of once per pixel.
+                for (component, target) in targets.iter_mut().enumerate() {
                     let block = &row_blocks[base + component];
+                    let bytes_per_sample = target.sample_type.bytes_per_sample();
+
+                    macro_rules! write_row {
+                        ($linearize:expr) => {
+                            for dy in 0..y_count {
+                                let y = block_y * 8 + dy;
+                                let row = &block[dy * 8..dy * 8 + x_count];
+                                let offset =
+                                    target.row_offsets[y] + block_x * 8 * bytes_per_sample;
+                                let out_row = &mut out[offset..][..x_count * bytes_per_sample];
+
+                                match target.sample_type {
+                                    SampleType::F16 => {
+                                        for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row)
+                                        {
+                                            let linear: f16 = $linearize(value);
+                                            chunk.copy_from_slice(&linear.to_bits().to_le_bytes());
+                                        }
+                                    }
+                                    SampleType::F32 => {
+                                        for (chunk, &value) in out_row.chunks_exact_mut(4).zip(row)
+                                        {
+                                            let linear: f16 = $linearize(value);
+                                            chunk.copy_from_slice(&linear.to_f32().to_le_bytes());
+                                        }
+                                    }
+                                    // rejected before decoding
+                                    SampleType::U32 => {
+                                        return Err(Error::unsupported(
+                                            "DWA lossy DCT compression of u32 channels",
+                                        ));
+                                    }
+                                }
+                            }
+                        };
+                    }
+
                     match to_linear {
-                        Some(to_linear) => {
-                            for dy in 0..y_count {
-                                let y = block_y * 8 + dy;
-                                let row = &block[dy * 8..dy * 8 + x_count];
-                                let out_row = &mut output[y * width + block_x * 8..][..x_count];
-                                for (dst, &value) in out_row.iter_mut().zip(row) {
-                                    let nonlinear = f16::from_f32(value);
-                                    *dst = f16::from_bits(to_linear[nonlinear.to_bits() as usize]);
-                                }
-                            }
-                        }
-                        None => {
-                            for dy in 0..y_count {
-                                let y = block_y * 8 + dy;
-                                let row = &block[dy * 8..dy * 8 + x_count];
-                                let out_row = &mut output[y * width + block_x * 8..][..x_count];
-                                for (dst, &value) in out_row.iter_mut().zip(row) {
-                                    *dst = f16::from_f32(value);
-                                }
-                            }
-                        }
+                        Some(to_linear) => write_row!(|value: f32| -> f16 {
+                            let nonlinear = f16::from_f32(value);
+                            f16::from_bits(to_linear[nonlinear.to_bits() as usize])
+                        }),
+                        None => write_row!(|value: f32| -> f16 { f16::from_f32(value) }),
                     }
                 }
             }
