@@ -115,6 +115,7 @@ pub(super) fn u16s_to_le_bytes(values: &[u16]) -> Vec<u8> {
 /// Split a planar buffer into one byte run per channel of the given scheme,
 /// in channel order (mirrors "DwaCompressor_setupChannelData"s running
 /// per-scheme cursor). Other schemes get an empty vec.
+#[cfg(test)]
 pub(super) fn split_planar_channels(
     infos: &[ChannelInfo],
     scheme: CompressorScheme,
@@ -138,6 +139,7 @@ pub(super) fn split_planar_channels(
 }
 
 /// Restore per-sample byte order from byte planes
+#[cfg(test)]
 pub(super) fn interleave_byte_planes(planar: &[u8], bytes_per_sample: usize) -> Vec<u8> {
     let sample_count = planar.len() / bytes_per_sample;
     let mut interleaved = vec![0u8; planar.len()];
@@ -154,8 +156,8 @@ pub(super) fn interleave_byte_planes(planar: &[u8], bytes_per_sample: usize) -> 
 /// ascending, channels in list order within each row, samples little-endian.
 /// Shared by the lossy DCT decode path (which writes its output directly at
 /// these offsets, avoiding an intermediate per-channel buffer + copy) and
-/// `write_scanlines` below (which still copies UNKNOWN/RLE planar data, since
-/// those need a layout transform decode_lossy_dct_group doesn't).
+/// `write_scanlines_fused` below (which still copies UNKNOWN/RLE planar data,
+/// since those need a layout transform decode_lossy_dct_group doesn't).
 pub(super) fn compute_row_offsets(
     channels: &ChannelList,
     infos: &[ChannelInfo],
@@ -185,16 +187,47 @@ pub(super) fn compute_row_offsets(
 /// Copy the UNKNOWN/RLE planar decode results into the scanline layout the
 /// rest of exrs expects, at the offsets `compute_row_offsets` assigned them.
 /// LossyDct channels are skipped: the lossy DCT decode already wrote them
-/// directly into `out` at the same offsets.
-pub(super) fn write_scanlines(
+/// directly into `out` at the same offsets. Reads straight from the section
+/// planar buffers into `out` in one pass -- no intermediate per-channel
+/// allocation. Mirrors OpenEXR C++'s `LOSSY_DCT`-sibling `RLE`/`UNKNOWN`
+/// cases in `internal_dwa_compressor.h` (t6/t7), which read directly from
+/// their planar-decode cursors into the final per-channel output rows.
+pub(super) fn write_scanlines_fused(
     channels: &ChannelList,
     infos: &[ChannelInfo],
     rectangle: IntegerBounds,
     row_offsets: &[Vec<usize>],
-    unknown_bytes: &[Vec<u8>],
-    rle_bytes: &[Vec<u8>],
+    unknown_planar: &[u8],
+    rle_planar: &[u8],
     out: &mut [u8],
-) {
+) -> Result<()> {
+    // Each channel's starting cursor into its scheme's planar buffer, in
+    // channel-list order -- mirrors split_planar_channels' cursor advance,
+    // computed once so the per-row loop below can index directly.
+    let mut unknown_cursor = vec![0usize; infos.len()];
+    let mut cursor = 0usize;
+    for (info, slot) in infos.iter().zip(unknown_cursor.iter_mut()) {
+        if info.scheme == CompressorScheme::Unknown {
+            *slot = cursor;
+            cursor += info.width * info.height * info.bytes_per_sample;
+        }
+    }
+    if cursor > unknown_planar.len() {
+        return Err(Error::invalid("truncated DWA channel data"));
+    }
+
+    let mut rle_cursor = vec![0usize; infos.len()];
+    let mut cursor = 0usize;
+    for (info, slot) in infos.iter().zip(rle_cursor.iter_mut()) {
+        if info.scheme == CompressorScheme::Rle {
+            *slot = cursor;
+            cursor += info.width * info.height * info.bytes_per_sample;
+        }
+    }
+    if cursor > rle_planar.len() {
+        return Err(Error::invalid("truncated DWA channel data"));
+    }
+
     for y in rectangle.position.y()..rectangle.end().y() {
         for (index, channel) in channels.list.iter().enumerate() {
             let sampling_y = channel.sampling.y().max(1) as i32;
@@ -203,19 +236,40 @@ pub(super) fn write_scanlines(
             }
 
             let info = &infos[index];
-            if info.scheme == CompressorScheme::LossyDct {
+            if info.scheme != CompressorScheme::Unknown && info.scheme != CompressorScheme::Rle {
                 continue;
             }
 
             let row = ((y - rectangle.position.y()) / sampling_y) as usize;
             let offset = row_offsets[index][row];
-            let row_length = info.width * info.bytes_per_sample;
+            let width = info.width;
+            let bytes_per_sample = info.bytes_per_sample;
+            let row_length = width * bytes_per_sample;
+            let out_row = &mut out[offset..offset + row_length];
 
-            let bytes =
-                if info.scheme == CompressorScheme::Unknown { &unknown_bytes[index] } else { &rle_bytes[index] };
-            out[offset..offset + row_length].copy_from_slice(&bytes[row * row_length..][..row_length]);
+            if info.scheme == CompressorScheme::Unknown {
+                let base = unknown_cursor[index] + row * row_length;
+                out_row.copy_from_slice(&unknown_planar[base..base + row_length]);
+            } else {
+                // RLE-decoded channels stay byte-plane separated (see
+                // `separate_byte_planes`): plane `byte` of this channel spans
+                // `sample_count` bytes starting at `channel_base + byte *
+                // sample_count`, samples in row-major (y then x) order.
+                let sample_count = width * info.height;
+                let channel_base = rle_cursor[index];
+                let row_sample_base = row * width;
+                for x in 0..width {
+                    let sample = row_sample_base + x;
+                    for byte in 0..bytes_per_sample {
+                        out_row[x * bytes_per_sample + byte] =
+                            rle_planar[channel_base + byte * sample_count + sample];
+                    }
+                }
+            }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

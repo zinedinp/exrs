@@ -140,3 +140,14 @@ overflow-checks = false
 lto = true
 debug = true
 codegen-units = 1
+
+# release-equivalent codegen but with LTO/inlining backed off and full debug
+# info kept, so perf/addr2line can resolve real function boundaries. Not used
+# for reported benchmark numbers (those come from [profile.release]) -- this
+# profile is for sampling-profiler investigation only.
+# `cargo build --profile profiling --features dwa-profile`
+[profile.profiling]
+inherits = "release"
+lto = false
+debug = 2
+codegen-units = 16

@@ -40,8 +40,8 @@ mod tests;
 pub mod profile;
 
 use channel_layout::{
-    compute_row_offsets, interleave_byte_planes, pack_rle_channels, pack_unknown_channels,
-    split_planar_channels, split_scanline_channels, u16s_to_le_bytes, write_scanlines,
+    compute_row_offsets, pack_rle_channels, pack_unknown_channels, split_scanline_channels,
+    u16s_to_le_bytes, write_scanlines_fused,
 };
 use channel_rules::{
     default_channel_rules, legacy_channel_rules, parse_channel_rules, write_relevant_channel_rules,
@@ -317,16 +317,15 @@ pub fn decompress(
 
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
-    let unknown_bytes =
-        split_planar_channels(&channel_infos, CompressorScheme::Unknown, &unknown_planar)?;
-    let rle_bytes: Vec<Vec<u8>> =
-        split_planar_channels(&channel_infos, CompressorScheme::Rle, &rle_planar)?
-            .into_iter()
-            .zip(&channel_infos)
-            .map(|(planar, info)| interleave_byte_planes(&planar, info.bytes_per_sample))
-            .collect();
-
-    write_scanlines(channels, &channel_infos, rectangle, &row_offsets, &unknown_bytes, &rle_bytes, &mut out);
+    write_scanlines_fused(
+        channels,
+        &channel_infos,
+        rectangle,
+        &row_offsets,
+        &unknown_planar,
+        &rle_planar,
+        &mut out,
+    )?;
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::ASSEMBLE_NS);
 

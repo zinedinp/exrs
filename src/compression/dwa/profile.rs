@@ -6,7 +6,7 @@
 // final scanline assembly. Atomics so parallel (rayon) decode can accumulate
 // from multiple threads; under parallel decode the totals are summed CPU
 // time across threads, not wall time.
-
+//
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
