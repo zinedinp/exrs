@@ -918,7 +918,7 @@ const TOO_MUCH_DATA: &str = "decoded data are longer than expected";
 
 #[cfg(test)]
 mod test {
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng, RngExt, SeedableRng};
 
     use super::*;
 
@@ -994,8 +994,8 @@ mod test {
     ];
 
     fn fill(rng: &mut impl Rng, size: usize) -> Vec<u16> {
-        if rng.gen_bool(0.2) {
-            let value = if rng.gen_bool(0.5) {
+        if rng.random_bool(0.2) {
+            let value = if rng.random_bool(0.5) {
                 0
             } else {
                 u16::MAX
@@ -1006,7 +1006,7 @@ mod test {
         let mut data = vec![0_u16; size];
 
         data.iter_mut().for_each(|v| {
-            *v = rng.gen_range(0_u16..u16::MAX);
+            *v = rng.random_range(0_u16..u16::MAX);
         });
 
         data
