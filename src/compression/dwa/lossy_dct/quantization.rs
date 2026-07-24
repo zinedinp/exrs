@@ -8,6 +8,16 @@ use half::f16;
 use super::{half_float_quantizer::algo_quantize, PackedStream};
 use crate::error::{Error, Result};
 
+/// JPEG-style zig-zag order for an 8x8 DCT block: index `i` is the zig-zag
+/// position of DCT-order coefficient `i` (and, symmetrically, the DCT-order
+/// position of zig-zag coefficient `i`) — this permutation is used as both a
+/// scatter (encode) and gather (decode) table.
+const ZIGZAG_ORDER: [usize; 64] = [
+    0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11,
+    18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60, 21, 34,
+    37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
+];
+
 pub(super) struct QuantTables {
     pub(super) y: [f32; 64],
     pub(super) half_y: [u16; 64],
@@ -59,12 +69,6 @@ pub(super) fn quantize_coefficients_to_zigzag(
     half_tolerances: &[u16; 64],
 ) -> [u16; 64] {
     // Quantize in DCT order, then scatter into the stored zig-zag layout.
-    const INV_REMAP: [usize; 64] = [
-        0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9,
-        11, 18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60,
-        21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
-    ];
-
     let mut half_zig = [0u16; 64];
     for i in 0..64 {
         let src = f16::from_f32(dct_values[i]).to_bits();
@@ -74,7 +78,7 @@ pub(super) fn quantize_coefficients_to_zigzag(
             tolerances[i],
             f16::from_bits(src).to_f32(),
         );
-        half_zig[INV_REMAP[i]] = quantized as u16;
+        half_zig[ZIGZAG_ORDER[i]] = quantized as u16;
     }
     half_zig
 }
@@ -182,13 +186,7 @@ pub(super) fn un_rle_ac(ac: &mut PackedStream<'_>, block: &mut [u16; 64]) -> Res
 pub(super) fn from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) {
     // The encoder stores coefficients in zig-zag order; the inverse DCT needs
     // normal 8x8 raster order.
-    const SRC_INDICES: [usize; 64] = [
-        0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9,
-        11, 18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60,
-        21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
-    ];
-
-    for (slot, &src_index) in dst.iter_mut().zip(SRC_INDICES.iter()) {
+    for (slot, &src_index) in dst.iter_mut().zip(ZIGZAG_ORDER.iter()) {
         *slot = f16::from_bits(zig_zag[src_index]).to_f32();
     }
 }

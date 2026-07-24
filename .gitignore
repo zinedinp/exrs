@@ -17,3 +17,6 @@ Cargo.lock
 # wasm build artifacts
 exrs-wasm/target/
 exrs-wasm/pkg/
+
+#ignore vendored files
+/vendor
