@@ -68,6 +68,14 @@ simd-benches = []
 # adds per chunk; negligible unless you're doing this exact measurement.
 dwa-profile = []
 
+# Override the AC-Huffman decode prefix-LUT size (huffman.rs' LUT_BITS)
+# Bigger trades fewer long-code fallbacks for more L1d pressure per DWA
+# chunk; the right choice depends the CPU L1d
+# Mutually force LTU size feature:
+huffman-lut-12 = []
+huffman-lut-13 = []
+huffman-lut-14 = []
+
 [[example]]
 name = "7_write_raw_blocks"
 required-features = ["rayon"]
@@ -157,3 +165,6 @@ codegen-units = 16
 # upstream pulp does not expose yet.
 [patch.crates-io]
 pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "gather_u16x8" }
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
+raw-cpuid = { version = "11.6.0", default-features = false }
