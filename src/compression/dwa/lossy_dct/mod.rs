@@ -20,6 +20,9 @@ mod half_float_quantizer;
 mod quantization;
 mod transfer_curve;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86;
+
 use quantization::{
     from_half_zigzag, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
 };

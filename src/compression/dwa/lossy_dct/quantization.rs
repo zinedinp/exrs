@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 /// position of DCT-order coefficient `i` (and, symmetrically, the DCT-order
 /// position of zig-zag coefficient `i`) — this permutation is used as both a
 /// scatter (encode) and gather (decode) table.
-const ZIGZAG_ORDER: [usize; 64] = [
+pub(super) const ZIGZAG_ORDER: [usize; 64] = [
     0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11,
     18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60, 21, 34,
     37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
@@ -184,6 +184,11 @@ pub(super) fn un_rle_ac(ac: &mut PackedStream<'_>, block: &mut [u16; 64]) -> Res
 /// Undo the zig-zag coefficient order (C "fromHalfZigZag_scalar"),
 /// converting half bits to f32.
 pub(super) fn from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if super::x86::try_from_half_zigzag(zig_zag, dst) {
+        return;
+    }
+
     // The encoder stores coefficients in zig-zag order; the inverse DCT needs
     // normal 8x8 raster order.
     for (slot, &src_index) in dst.iter_mut().zip(ZIGZAG_ORDER.iter()) {

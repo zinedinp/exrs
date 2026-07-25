@@ -151,3 +151,9 @@ inherits = "release"
 lto = false
 debug = 2
 codegen-units = 16
+
+# TEMPORARY: routes `pulp` to a fork that adds safe wrappers for the F16C
+# half<->float conversion intrinsics (`_mm256_cvtph_ps` and friends), which
+# upstream pulp does not expose yet.
+[patch.crates-io]
+pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "main" }
