@@ -157,12 +157,14 @@ const MAX_CODE_LENGTH: usize = 58;
 // - `fixed_lut` (everything else -- non-x86 targets, or any target with a
 //   `huffman-lut-*` feature pinned): a single compile-time `LUT_BITS`, same
 //   as before this runtime-dispatch addition -- a pinned feature wins
-//   outright; otherwise Apple Silicon (`cfg!(target_os = "macos",
-//   target_arch = "aarch64")`) defaults to 14 bits (unverified, same
-//   reasoning as above, just resolved at compile time instead of runtime
-//   since `raw-cpuid` only speaks x86 CPUID and no aarch64 hardware was
-//   available to build or verify an equivalent probe), everything else
-//   defaults to 13.
+//   outright; otherwise: Apple Silicon (`macos`+`aarch64`, 128-192 KiB L1d)
+//   gets 14 bits; 32-bit ARM (`target_arch = "arm"` -- ARMv6/v7 boards like
+//   Raspberry Pi Zero/1/2, typically 16-32 KiB L1d, smaller than even the
+//   12-bit tier's 20 KiB) gets 12 bits; everything else (generic aarch64:
+//   Raspberry Pi 4/5, server parts like Graviton/Ampere, 32-64 KiB+ L1d)
+//   gets 13. All three are research-based (typical L1d for each core family),
+//   not benchmark-verified -> non-x86 doesn't get a runtime probe like
+//   `dual_lut`'s, since `raw-cpuid` only speaks x86 CPUID.
 #[cfg(all(feature = "huffman-lut-12", feature = "huffman-lut-13"))]
 compile_error!("huffman-lut-12 and huffman-lut-13 are mutually exclusive");
 #[cfg(all(feature = "huffman-lut-12", feature = "huffman-lut-14"))]
@@ -183,9 +185,10 @@ use fixed_lut::CanonicalDecoder;
 ))]
 use dual_lut::CanonicalDecoder;
 
-/// Single compile-time-fixed `LUT_BITS`. Active
-/// on non-x86 targets, or on any target with a `huffman-lut-*` feature
-/// pinned.
+/// Single compile-time-fixed `LUT_BITS`, sized off each target's typical L1d
+/// (research-based, not benchmarked): 14 bits on Apple Silicon, 12 bits on
+/// 32-bit ARM (small L1d), 13 bits everywhere else non-x86. Active on
+/// non-x86 targets, or on any target with a `huffman-lut-*` feature pinned.
 #[cfg(any(
     feature = "huffman-lut-12",
     feature = "huffman-lut-13",
@@ -202,7 +205,13 @@ mod fixed_lut {
     #[cfg(feature = "huffman-lut-14")]
     const LUT_BITS: usize = 14;
     #[cfg(not(any(feature = "huffman-lut-12", feature = "huffman-lut-13", feature = "huffman-lut-14")))]
-    const LUT_BITS: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 14 } else { 13 };
+    const LUT_BITS: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        14
+    } else if cfg!(target_arch = "arm") {
+        12
+    } else {
+        13
+    };
     const LUT_SIZE: usize = 1 << LUT_BITS;
 
     /// Canonical left-justified decoder.
