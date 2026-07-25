@@ -90,10 +90,17 @@ pub(super) fn decode_dc_section(section: &[u8], header: &DwaHeader) -> Result<Ve
 pub(super) fn decode_rle_section_into(
     section: &[u8],
     header: &DwaHeader,
+    max_raw_size: usize,
     buffer: &mut Vec<u8>,
 ) -> Result<usize> {
     if header.rle_raw_size == 0 {
         return Ok(0);
+    }
+    // The buffer is sized from the header up front, so a corrupt chunk must
+    // not be able to ask for an arbitrarily large allocation: the RLE
+    // channels can never read more than `max_raw_size` bytes back out.
+    if header.rle_raw_size > max_raw_size {
+        return Err(Error::invalid("DWA RLE data size"));
     }
     #[cfg(feature = "dwa-profile")]
     let t = super::profile::start();
@@ -101,16 +108,23 @@ pub(super) fn decode_rle_section_into(
     #[cfg(feature = "dwa-profile")]
     t.stop(&super::profile::RLE_INFLATE_NS);
 
+    // Only ever grown, never re-zeroed per chunk: the caller is handed
+    // `[..written]`, and the expansion below writes every one of those bytes,
+    // so bytes left over from a previous chunk are never observable.
     #[cfg(feature = "dwa-profile")]
     let t = super::profile::start();
-    buffer.clear();
-    buffer.resize(header.rle_raw_size, 0);
+    if buffer.len() < header.rle_raw_size {
+        buffer.resize(header.rle_raw_size, 0);
+    }
     #[cfg(feature = "dwa-profile")]
     t.stop(&super::profile::RLE_ALLOC_NS);
 
     #[cfg(feature = "dwa-profile")]
     let t = super::profile::start();
-    let written = crate::compression::rle::unpack_rle_tokens_into(&inflated, buffer)?;
+    let written = crate::compression::rle::unpack_rle_tokens_into(
+        &inflated,
+        &mut buffer[..header.rle_raw_size],
+    )?;
     #[cfg(feature = "dwa-profile")]
     t.stop(&super::profile::RLE_UNPACK_NS);
 

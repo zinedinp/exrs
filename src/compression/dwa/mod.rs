@@ -40,8 +40,8 @@ mod tests;
 pub mod profile;
 
 use channel_layout::{
-    compute_row_offsets, pack_rle_channels, pack_unknown_channels, split_scanline_channels,
-    u16s_to_le_bytes, write_scanlines_fused,
+    compute_row_offsets, pack_rle_channels, pack_unknown_channels, rle_planar_size,
+    split_scanline_channels, u16s_to_le_bytes, write_scanlines_fused,
 };
 use channel_rules::{
     default_channel_rules, legacy_channel_rules, parse_channel_rules, write_relevant_channel_rules,
@@ -303,7 +303,12 @@ pub fn decompress(
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
     let mut rle_buffer = RLE_BUFFER.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
-    let rle_length = decode_rle_section_into(rle_section, &header, &mut rle_buffer)?;
+    let rle_length = decode_rle_section_into(
+        rle_section,
+        &header,
+        rle_planar_size(&channel_infos),
+        &mut rle_buffer,
+    )?;
     let rle_planar = &rle_buffer[..rle_length];
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::RLE_NS);

@@ -52,11 +52,12 @@ pub(super) fn unpack_rle_tokens(
     Ok(decompressed_le)
 }
 
-/// EXPERIMENT (not for keeping as-is): the same token format as
-/// `unpack_rle_tokens`, but expanding into a caller-preallocated buffer the
-/// way OpenEXR's `internal_rle_decompress` does, so each token becomes one
-/// `copy_from_slice`/`fill` on a known-length slice instead of a `Vec`
-/// append that has to re-check capacity and can reallocate.
+/// The same token format as `unpack_rle_tokens`, but expanding into a
+/// caller-owned buffer the way OpenEXR's `internal_rle_decompress` does, so
+/// the buffer can be reused across chunks instead of being allocated (and
+/// page-faulted in) once per chunk. Returns the number of bytes written;
+/// unlike `unpack_rle_tokens` a token stream that would run past the end of
+/// the buffer is rejected rather than expanded and then ignored.
 pub(super) fn unpack_rle_tokens_into(compressed_le: &[u8], out: &mut [u8]) -> Result<usize> {
     let mut remaining_le = compressed_le;
     let mut written = 0usize;

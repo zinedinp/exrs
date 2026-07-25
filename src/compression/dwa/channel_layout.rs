@@ -222,6 +222,18 @@ pub(super) fn compute_row_offsets(
     offsets
 }
 
+/// Total size of the planar RLE buffer the RLE channels read from, i.e. how
+/// far the RLE section is allowed to expand. The decoder checks the chunk
+/// header's claimed size against this before allocating, the way OpenEXR
+/// rejects an `rleRawSize` larger than its `_planarUncBuffer[RLE]`.
+pub(super) fn rle_planar_size(infos: &[ChannelInfo]) -> usize {
+    infos
+        .iter()
+        .filter(|info| info.scheme == CompressorScheme::Rle)
+        .map(|info| info.width * info.height * info.bytes_per_sample)
+        .sum()
+}
+
 /// Copy the UNKNOWN/RLE planar decode results into the scanline layout the
 /// rest of exrs expects, at the offsets `compute_row_offsets` assigned them.
 /// LossyDct channels are skipped: the lossy DCT decode already wrote them
@@ -262,6 +274,7 @@ pub(super) fn write_scanlines_fused(
             cursor += info.width * info.height * info.bytes_per_sample;
         }
     }
+    debug_assert_eq!(cursor, rle_planar_size(infos));
     if cursor > rle_planar.len() {
         return Err(Error::invalid("truncated DWA channel data"));
     }
