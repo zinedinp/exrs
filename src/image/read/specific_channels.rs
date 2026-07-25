@@ -391,6 +391,9 @@ where
             }
         }
 
+        // every sample has been copied into the image, so the buffer can be
+        // handed back for the next chunk to decompress into
+        crate::block::pool::recycle(block.data);
         Ok(())
     }
 
@@ -468,6 +471,8 @@ where
             }
         }
 
+        // see the comment on the equivalent line in `SpecificChannelsReader`
+        crate::block::pool::recycle(block.data);
         Ok(())
     }
 
@@ -574,6 +579,10 @@ where
                                 }
                             }
 
+                            // recycled from the same worker that decompressed
+                            // into it, so the next chunk on this thread can
+                            // reuse the pages it just faulted in
+                            crate::block::pool::recycle(block.data);
                             Ok(())
                         });
 

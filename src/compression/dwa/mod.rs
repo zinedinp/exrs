@@ -318,13 +318,14 @@ pub fn decompress(
 
     let row_offsets = compute_row_offsets(channels, &channel_infos, rectangle);
 
-    // Freshly allocated per chunk, and handed to the caller, so unlike the RLE
-    // buffer it cannot be reused here. Note that this timer sees almost none of
-    // its real cost: the zero pages are only faulted in when they are first
-    // written, which happens in the two stages below
+    // Handed to the caller, so unlike the RLE buffer this one cannot be kept
+    // here -- it comes from the block buffer pool instead, which the readers
+    // hand it back to once they have copied the samples out. A freshly mapped
+    // buffer would be faulted in page by page during the two stages below,
+    // which costs more than zeroing a recycled one does.
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
-    let mut out = vec![0u8; expected_byte_size];
+    let mut out = crate::block::pool::take_zeroed(expected_byte_size);
     #[cfg(feature = "dwa-profile")]
     {
         t.stop(&profile::OUT_ALLOC_NS);
