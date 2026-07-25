@@ -50,7 +50,7 @@ use channel_rules::{
 use chunk_header::{AcCompression, DwaHeader};
 use lossy_dct::{decode_lossy_channels, encode_lossy_channels};
 use section_stream::{
-    decode_ac_section, decode_dc_section, decode_rle_section, decode_unknown_section,
+    decode_ac_section, decode_dc_section, decode_rle_section_into, decode_unknown_section,
     split_sections, zip_deconstruct_bytes,
 };
 
@@ -293,9 +293,18 @@ pub fn decompress(
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::DC_NS);
 
+    // Reused across every chunk this thread decodes (see
+    // `decode_rle_section_into`); taken out for the duration of the decode and
+    // put back at the end, so a chunk that errors out simply forfeits it.
+    thread_local! {
+        static RLE_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
-    let rle_planar = decode_rle_section(rle_section, &header)?;
+    let mut rle_buffer = RLE_BUFFER.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    let rle_length = decode_rle_section_into(rle_section, &header, &mut rle_buffer)?;
+    let rle_planar = &rle_buffer[..rle_length];
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::RLE_NS);
 
@@ -323,11 +332,13 @@ pub fn decompress(
         rectangle,
         &row_offsets,
         &unknown_planar,
-        &rle_planar,
+        rle_planar,
         &mut out,
     )?;
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::ASSEMBLE_NS);
+
+    RLE_BUFFER.with(|buffer| *buffer.borrow_mut() = rle_buffer);
 
     crate::compression::convert_little_endian_to_current(out, channels, rectangle)
 }

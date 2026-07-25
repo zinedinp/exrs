@@ -14,6 +14,12 @@ pub static UNKNOWN_NS: AtomicU64 = AtomicU64::new(0);
 pub static AC_NS: AtomicU64 = AtomicU64::new(0);
 pub static DC_NS: AtomicU64 = AtomicU64::new(0);
 pub static RLE_NS: AtomicU64 = AtomicU64::new(0);
+// RLE sub-stages, mirroring the two calls OpenEXR's timed t3 block makes
+// (`exr_uncompress_buffer` then `internal_rle_decompress`), so the 2.8x
+// stage-level gap can be attributed to one or the other.
+pub static RLE_INFLATE_NS: AtomicU64 = AtomicU64::new(0);
+pub static RLE_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
+pub static RLE_UNPACK_NS: AtomicU64 = AtomicU64::new(0);
 pub static DCT_NS: AtomicU64 = AtomicU64::new(0);
 pub static ASSEMBLE_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -29,7 +35,17 @@ impl Timer {
 }
 
 pub fn reset() {
-    for counter in [&UNKNOWN_NS, &AC_NS, &DC_NS, &RLE_NS, &DCT_NS, &ASSEMBLE_NS] {
+    for counter in [
+        &UNKNOWN_NS,
+        &AC_NS,
+        &DC_NS,
+        &RLE_NS,
+        &RLE_INFLATE_NS,
+        &RLE_ALLOC_NS,
+        &RLE_UNPACK_NS,
+        &DCT_NS,
+        &ASSEMBLE_NS,
+    ] {
         counter.store(0, Ordering::Relaxed);
     }
 }
@@ -40,11 +56,14 @@ pub fn report(divisor: u64) {
         counter.load(Ordering::Relaxed) as f64 / divisor.max(1) as f64 / 1_000_000.0
     };
     eprintln!(
-        "dwa-profile (avg ms/iter): unknown={:.3} ac_huffman={:.3} dc={:.3} rle={:.3} lossy_dct={:.3} assemble={:.3}",
+        "dwa-profile (avg ms/iter): unknown={:.3} ac_huffman={:.3} dc={:.3} rle={:.3} (rle_inflate={:.3} rle_alloc={:.3} rle_unpack={:.3}) lossy_dct={:.3} assemble={:.3}",
         ms(&UNKNOWN_NS),
         ms(&AC_NS),
         ms(&DC_NS),
         ms(&RLE_NS),
+        ms(&RLE_INFLATE_NS),
+        ms(&RLE_ALLOC_NS),
+        ms(&RLE_UNPACK_NS),
         ms(&DCT_NS),
         ms(&ASSEMBLE_NS),
     );

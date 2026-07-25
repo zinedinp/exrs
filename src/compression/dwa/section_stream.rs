@@ -82,12 +82,39 @@ pub(super) fn decode_dc_section(section: &[u8], header: &DwaHeader) -> Result<Ve
 
 /// RLE section: zlib, then classic byte-oriented RLE. Result is planar per
 /// channel, each channel further split into byte planes.
-pub(super) fn decode_rle_section(section: &[u8], header: &DwaHeader) -> Result<Vec<u8>> {
+/// Expands into `buffer`, reusing whatever capacity it already has, and
+/// returns how many bytes were written -- OpenEXR keeps one `_planarUncBuffer`
+/// alive across every chunk it decodes, and allocating a fresh output buffer
+/// per chunk instead costs more (in page faults on the never-touched pages)
+/// than the entire RLE expansion does.
+pub(super) fn decode_rle_section_into(
+    section: &[u8],
+    header: &DwaHeader,
+    buffer: &mut Vec<u8>,
+) -> Result<usize> {
     if header.rle_raw_size == 0 {
-        return Ok(vec![]);
+        return Ok(0);
     }
+    #[cfg(feature = "dwa-profile")]
+    let t = super::profile::start();
     let inflated = inflate(section, header.rle_uncompressed_size)?;
-    crate::compression::rle::unpack_rle_tokens(&inflated, header.rle_raw_size, false)
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&super::profile::RLE_INFLATE_NS);
+
+    #[cfg(feature = "dwa-profile")]
+    let t = super::profile::start();
+    buffer.clear();
+    buffer.resize(header.rle_raw_size, 0);
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&super::profile::RLE_ALLOC_NS);
+
+    #[cfg(feature = "dwa-profile")]
+    let t = super::profile::start();
+    let written = crate::compression::rle::unpack_rle_tokens_into(&inflated, buffer)?;
+    #[cfg(feature = "dwa-profile")]
+    t.stop(&super::profile::RLE_UNPACK_NS);
+
+    Ok(written)
 }
 
 /// Ports "internal_zip_reconstruct_bytes": undo differencing, then

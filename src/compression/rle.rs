@@ -52,6 +52,42 @@ pub(super) fn unpack_rle_tokens(
     Ok(decompressed_le)
 }
 
+/// EXPERIMENT (not for keeping as-is): the same token format as
+/// `unpack_rle_tokens`, but expanding into a caller-preallocated buffer the
+/// way OpenEXR's `internal_rle_decompress` does, so each token becomes one
+/// `copy_from_slice`/`fill` on a known-length slice instead of a `Vec`
+/// append that has to re-check capacity and can reallocate.
+pub(super) fn unpack_rle_tokens_into(compressed_le: &[u8], out: &mut [u8]) -> Result<usize> {
+    let mut remaining_le = compressed_le;
+    let mut written = 0usize;
+
+    while !remaining_le.is_empty() && written != out.len() {
+        let count = take_1(&mut remaining_le)? as i8 as i32;
+
+        if count < 0 {
+            let length = -count as usize;
+            let values = take_n(&mut remaining_le, length)?;
+            let end = written.checked_add(length).ok_or_else(|| Error::invalid("compressed data"))?;
+            if end > out.len() {
+                return Err(Error::invalid("compressed data"));
+            }
+            out[written..end].copy_from_slice(values);
+            written = end;
+        } else {
+            let length = count as usize + 1;
+            let value = take_1(&mut remaining_le)?;
+            let end = written.checked_add(length).ok_or_else(|| Error::invalid("compressed data"))?;
+            if end > out.len() {
+                return Err(Error::invalid("compressed data"));
+            }
+            out[written..end].fill(value);
+            written = end;
+        }
+    }
+
+    Ok(written)
+}
+
 pub fn compress_bytes(
     channels: &ChannelList,
     uncompressed_ne: ByteVec,
