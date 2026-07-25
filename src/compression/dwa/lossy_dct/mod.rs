@@ -453,6 +453,22 @@ fn decode_lossy_dct_group(
                                     target.row_offsets[y] + block_x * 8 * bytes_per_sample;
                                 let out_row = &mut out[offset..][..x_count * bytes_per_sample];
 
+                                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                                {
+                                    let handled = match target.sample_type {
+                                        SampleType::F16 => {
+                                            x86::try_write_row_f16(row, to_linear, out_row)
+                                        }
+                                        SampleType::F32 => {
+                                            x86::try_write_row_f32(row, to_linear, out_row)
+                                        }
+                                        SampleType::U32 => false,
+                                    };
+                                    if handled {
+                                        continue;
+                                    }
+                                }
+
                                 match target.sample_type {
                                     SampleType::F16 => {
                                         for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row)
@@ -480,9 +496,9 @@ fn decode_lossy_dct_group(
                     }
 
                     match to_linear {
-                        Some(to_linear) => write_row!(|value: f32| -> f16 {
+                        Some(table) => write_row!(|value: f32| -> f16 {
                             let nonlinear = f16::from_f32(value);
-                            f16::from_bits(to_linear[nonlinear.to_bits() as usize])
+                            f16::from_bits(table[nonlinear.to_bits() as usize])
                         }),
                         None => write_row!(|value: f32| -> f16 { f16::from_f32(value) }),
                     }

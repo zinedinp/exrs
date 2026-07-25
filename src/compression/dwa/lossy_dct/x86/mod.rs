@@ -5,6 +5,8 @@
 // Needs the `V3` tier (for its SSE2/SSSE3/SSE4.1 tokens) and `F16c`; if either
 // is missing, the caller falls back to the scalar path.
 
+use std::convert::TryInto;
+
 use pulp::core_arch::x86::F16c;
 use pulp::x86::V3;
 
@@ -15,6 +17,111 @@ pub(super) fn try_from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) -> 
     } else {
         false
     }
+}
+
+// Rounding-mode immediate for `vcvtps2ph`: `_MM_FROUND_TO_NEAREST_INT` (0).
+// Must match the immediate `half::f16::from_f32`'s own F16C fast path uses
+// (half's `arch/x86.rs`), so the two conversions are bit-identical.
+const ROUND_TO_NEAREST: i32 = 0;
+
+// Mirrors OpenEXR's `LossyDctDecoder_execute` SSE2 fast path
+// (internal_dwa_decoder.h): one `vcvtps2ph` converts a full 8-wide row of DCT
+// output to nonlinear half bits (matching `half::f16::from_f32`'s own F16C
+// path bit-for-bit), each lane is extracted to a GPR to index `to_linear`
+fn linearize_lanes(
+    v3: V3,
+    bits: std::arch::x86_64::__m128i,
+    to_linear: &[u16; 65536],
+) -> std::arch::x86_64::__m128i {
+    let sse2 = v3.sse2;
+
+    let i0 = sse2._mm_extract_epi16::<0>(bits);
+    let i1 = sse2._mm_extract_epi16::<1>(bits);
+    let i2 = sse2._mm_extract_epi16::<2>(bits);
+    let i3 = sse2._mm_extract_epi16::<3>(bits);
+    let i4 = sse2._mm_extract_epi16::<4>(bits);
+    let i5 = sse2._mm_extract_epi16::<5>(bits);
+    let i6 = sse2._mm_extract_epi16::<6>(bits);
+    let i7 = sse2._mm_extract_epi16::<7>(bits);
+
+    // `_mm_extract_epi16` zero-extends, so each `iN` is already a valid
+    // 0..=65535 table index.
+    let r0 = to_linear[i0 as usize] as i32;
+    let r1 = to_linear[i1 as usize] as i32;
+    let r2 = to_linear[i2 as usize] as i32;
+    let r3 = to_linear[i3 as usize] as i32;
+    let r4 = to_linear[i4 as usize] as i32;
+    let r5 = to_linear[i5 as usize] as i32;
+    let r6 = to_linear[i6 as usize] as i32;
+    let r7 = to_linear[i7 as usize] as i32;
+
+    let v = sse2._mm_insert_epi16::<0>(sse2._mm_setzero_si128(), r0);
+    let v = sse2._mm_insert_epi16::<1>(v, r1);
+    let v = sse2._mm_insert_epi16::<2>(v, r2);
+    let v = sse2._mm_insert_epi16::<3>(v, r3);
+    let v = sse2._mm_insert_epi16::<4>(v, r4);
+    let v = sse2._mm_insert_epi16::<5>(v, r5);
+    let v = sse2._mm_insert_epi16::<6>(v, r6);
+    let v = sse2._mm_insert_epi16::<7>(v, r7);
+    v
+}
+
+/// Vectorized version of `decode_lossy_dct_group`'s F16-output write-row
+/// loop for a full 8-wide row.
+pub(super) fn try_write_row_f16(
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let (Some(v3), Some(f16c)) = (V3::try_new(), F16c::try_new()) else {
+        return false;
+    };
+    let Ok(&row): Result<&[f32; 8], _> = row.try_into() else {
+        return false;
+    };
+    if out_row.len() != 16 {
+        return false;
+    }
+
+    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
+    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
+    let linear = match to_linear {
+        Some(table) => linearize_lanes(v3, nonlinear, table),
+        None => nonlinear,
+    };
+    let bytes: [u8; 16] = pulp::cast!(linear);
+    out_row.copy_from_slice(&bytes);
+    true
+}
+
+/// Same as `try_write_row_f16`, but widens the linearized halves back to f32
+/// (via a second `vcvtph2ps`) for F32-sample-type channels, matching the
+/// scalar path's `linear.to_f32()`.
+pub(super) fn try_write_row_f32(
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let (Some(v3), Some(f16c)) = (V3::try_new(), F16c::try_new()) else {
+        return false;
+    };
+    let Ok(&row): Result<&[f32; 8], _> = row.try_into() else {
+        return false;
+    };
+    if out_row.len() != 32 {
+        return false;
+    }
+
+    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
+    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
+    let linear = match to_linear {
+        Some(table) => linearize_lanes(v3, nonlinear, table),
+        None => nonlinear,
+    };
+    let widened = f16c._mm256_cvtph_ps(linear);
+    let bytes: [u8; 32] = pulp::cast!(widened);
+    out_row.copy_from_slice(&bytes);
+    true
 }
 
 fn from_half_zigzag(v3: V3, f16c: F16c, src: &[u16; 64], dst: &mut [f32; 64]) {
@@ -125,6 +232,7 @@ fn from_half_zigzag(v3: V3, f16c: F16c, src: &[u16; 64], dst: &mut [f32; 64]) {
 #[cfg(all(test, feature = "avx2-tests"))]
 mod test {
     use super::super::quantization::ZIGZAG_ORDER;
+    use super::super::transfer_curve::to_linear_table;
     use half::f16;
 
     /// The permuted+widened output must be bit-identical to the scalar gather,
@@ -157,5 +265,139 @@ mod test {
                 );
             }
         }
+    }
+
+    /// Scalar reference for the write-row SIMD path: exactly what
+    /// `decode_lossy_dct_group`'s `write_row!` macro computes per pixel.
+    fn scalar_linear_bits(value: f32, to_linear: Option<&[u16; 65536]>) -> u16 {
+        let nonlinear = f16::from_f32(value);
+        match to_linear {
+            Some(table) => table[nonlinear.to_bits() as usize],
+            None => nonlinear.to_bits(),
+        }
+    }
+
+    /// A wide, pseudo-random sweep across the full f32 bit space (every
+    /// exponent/mantissa/sign region gets hit, not just small values near
+    /// zero), plus explicit special values DCT output could plausibly
+    /// produce or a table lookup could return.
+    fn sweep_rows() -> impl Iterator<Item = [f32; 8]> {
+        let special = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            f32::EPSILON,
+            65504.0,  // half::MAX
+            65520.0,  // rounds to infinity in half
+            -65504.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fc00001), // NaN, alternate payload
+            f32::from_bits(0x00000001), // smallest positive subnormal
+            f32::from_bits(0x0000ffff), // subnormal, near boundary
+            6.104_f32.exp2() * f32::EPSILON, // arbitrary small-normal-ish value
+        ];
+        let special_rows: Vec<[f32; 8]> = special
+            .chunks(8)
+            .map(|chunk| {
+                let mut row = [0.0f32; 8];
+                row[..chunk.len()].copy_from_slice(chunk);
+                row
+            })
+            .collect();
+
+        let swept_rows = (0u32..=0xFFFF).map(|base| {
+            std::array::from_fn(|lane| {
+                // A large odd stride spreads `lane` across every exponent
+                // range as `base` walks the low bits, unlike a plain +lane
+                // which would only ever perturb the mantissa.
+                f32::from_bits(base.wrapping_add(lane as u32 * 0x1000_0001))
+            })
+        });
+
+        special_rows.into_iter().chain(swept_rows)
+    }
+
+    fn assert_bits_match(a: u16, b: u16, context: &str) {
+        // NaN half bit patterns aren't unique (many payloads map to "NaN"),
+        // so only require both sides agree on NaN-ness, matching `half`'s
+        // own equality semantics; everything else must be bit-exact.
+        let a_nan = f16::from_bits(a).is_nan();
+        let b_nan = f16::from_bits(b).is_nan();
+        if a_nan || b_nan {
+            assert_eq!(
+                a_nan, b_nan,
+                "{}: one side is NaN, the other isn't (a=0x{:04x}, b=0x{:04x})",
+                context, a, b
+            );
+        } else {
+            assert_eq!(a, b, "{}: bit mismatch (a=0x{:04x}, b=0x{:04x})", context, a, b);
+        }
+    }
+
+    #[test]
+    fn write_row_f16_matches_scalar() {
+        for to_linear in [None, Some(to_linear_table())] {
+            for row in sweep_rows() {
+                let mut simd = [0u8; 16];
+                assert!(super::try_write_row_f16(&row, to_linear, &mut simd));
+
+                for (lane, &value) in row.iter().enumerate() {
+                    let expected = scalar_linear_bits(value, to_linear);
+                    let actual = u16::from_le_bytes([simd[lane * 2], simd[lane * 2 + 1]]);
+                    assert_bits_match(
+                        actual,
+                        expected,
+                        &format!("f16 lane {lane}, value {value:e}, to_linear={}", to_linear.is_some()),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_row_f32_matches_scalar() {
+        for to_linear in [None, Some(to_linear_table())] {
+            for row in sweep_rows() {
+                let mut simd = [0u8; 32];
+                assert!(super::try_write_row_f32(&row, to_linear, &mut simd));
+
+                for (lane, &value) in row.iter().enumerate() {
+                    let expected = f16::from_bits(scalar_linear_bits(value, to_linear)).to_f32();
+                    let actual = f32::from_le_bytes([
+                        simd[lane * 4],
+                        simd[lane * 4 + 1],
+                        simd[lane * 4 + 2],
+                        simd[lane * 4 + 3],
+                    ]);
+                    if expected.is_nan() {
+                        assert!(
+                            actual.is_nan(),
+                            "f32 lane {}, value {:e}: expected NaN, got {:e}",
+                            lane, value, actual,
+                        );
+                    } else {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "f32 lane {}, value {:e}, to_linear={}",
+                            lane, value, to_linear.is_some()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_row_falls_back_for_short_rows() {
+        let row = [0.0f32; 7];
+        let mut out16 = [0u8; 14];
+        let mut out32 = [0u8; 28];
+        assert!(!super::try_write_row_f16(&row, None, &mut out16));
+        assert!(!super::try_write_row_f32(&row, None, &mut out32));
     }
 }
