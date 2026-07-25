@@ -30,6 +30,24 @@ use crate::{
 };
 
 pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut words = Vec::new();
+    decompress_into(compressed, expected_size, &mut out, &mut words)?;
+    Ok(out)
+}
+
+/// Same as [`decompress`], but writes into caller-supplied buffers instead of
+/// allocating fresh ones. `out` and `words` are grown as needed and never
+/// shrunk, so a caller that reuses them across chunks,
+/// pays the allocation only for the largest chunk it has seen. On success
+/// `out[..expected_size]` holds the result; any bytes beyond that are leftover
+/// capacity from a larger previous call and must be ignored.
+pub(crate) fn decompress_into(
+    compressed: &[u8],
+    expected_size: usize,
+    out: &mut Vec<u16>,
+    words: &mut Vec<u64>,
+) -> UnitResult {
     let mut remaining_compressed = compressed;
 
     let min_code_index = usize::try_from(u32::read_le(&mut remaining_compressed)?)?;
@@ -53,7 +71,14 @@ pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
         return Err(Error::invalid(INVALID_BIT_COUNT));
     }
 
-    decoder.decode(remaining_compressed, bit_count, max_code_index_32, expected_size)
+    decoder.decode_into(
+        remaining_compressed,
+        bit_count,
+        max_code_index_32,
+        expected_size,
+        out,
+        words,
+    )
 }
 
 pub fn compress(uncompressed: &[u16]) -> Result<Vec<u8>> {
@@ -266,16 +291,21 @@ impl CanonicalDecoder {
         })
     }
 
-    fn decode(
+    fn decode_into(
         &self,
         data: &[u8],
         bit_count: usize,
         run_length_code: u32,
         expected_output_size: usize,
-    ) -> Result<Vec<u16>> {
+        out: &mut Vec<u16>,
+        words: &mut Vec<u64>,
+    ) -> UnitResult {
         // bitstream as big-endian words, zero-padded so the two-word loads
-        // stay in range (incl. a run count read on a corrupt stream)
-        let mut words = Vec::with_capacity(data.len() / 8 + 3);
+        // stay in range (incl. a run count read on a corrupt stream).
+        // Grow-only reuse of caller-supplied storage: `words` and `out` keep
+        // whatever capacity a previous (larger) chunk left them with, so a
+        // steady-state stream of same-sized chunks allocates nothing here.
+        words.clear();
         let mut chunks = data.chunks_exact(8);
         for chunk in &mut chunks {
             words.push(u64::from_be_bytes(<[u8; 8]>::try_from(chunk).expect("chunk size is 8")));
@@ -287,9 +317,16 @@ impl CanonicalDecoder {
             words.push(u64::from_be_bytes(last));
         }
         words.extend_from_slice(&[0, 0]);
+        let words = &words[..];
 
-        // index output; the expected-size check doubles as the bounds check
-        let mut out = vec![0_u16; expected_output_size];
+        // index output; the expected-size check doubles as the bounds check.
+        // Only ever grown: the slice below limits every access (read and
+        // write) to exactly `expected_output_size`, so leftover elements from
+        // a larger previous call are neither read nor observable.
+        if out.len() < expected_output_size {
+            out.resize(expected_output_size, 0);
+        }
+        let out = &mut out[..expected_output_size];
         let mut out_position = 0_usize;
         let mut position = 0_usize; // stream position in bits
 
@@ -330,7 +367,7 @@ impl CanonicalDecoder {
                         (read_word_at(&words, position + (64 - remaining) + len) >> 56) as usize
                     };
 
-                    out_position = extend_with_run(&mut out, out_position, count)?;
+                    out_position = extend_with_run(out, out_position, count)?;
 
                     if remaining >= len + 8 {
                         remaining -= len + 8;
@@ -387,7 +424,7 @@ impl CanonicalDecoder {
                         (read_word_at(&words, position + len) >> 56) as usize
                     };
 
-                    out_position = extend_with_run(&mut out, out_position, count)?;
+                    out_position = extend_with_run(out, out_position, count)?;
 
                     position += len + 8;
                     if remaining >= len + 8 {
@@ -415,7 +452,7 @@ impl CanonicalDecoder {
             return Err(Error::invalid(NOT_ENOUGH_DATA));
         }
 
-        Ok(out)
+        Ok(())
     }
 
     /// Length and symbol of a code longer than `LUT_BITS` (rare): scan for

@@ -156,4 +156,4 @@ codegen-units = 16
 # half<->float conversion intrinsics (`_mm256_cvtph_ps` and friends), which
 # upstream pulp does not expose yet.
 [patch.crates-io]
-pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "main" }
+pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "gather_u16x8" }

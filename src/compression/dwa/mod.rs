@@ -50,7 +50,7 @@ use channel_rules::{
 use chunk_header::{AcCompression, DwaHeader};
 use lossy_dct::{decode_lossy_channels, encode_lossy_channels};
 use section_stream::{
-    decode_ac_section, decode_dc_section, decode_rle_section_into, decode_unknown_section,
+    decode_ac_section_into, decode_dc_section, decode_rle_section_into, decode_unknown_section,
     split_sections, zip_deconstruct_bytes,
 };
 
@@ -284,9 +284,24 @@ pub fn decompress(
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::UNKNOWN_NS);
 
+    // Reused across every chunk this thread decodes, same reasoning as
+    // `RLE_BUFFER` below: `ac_buffer` is the Huffman-decoded AC coefficient
+    // stream, `ac_words_buffer` is scratch space the decoder rebuilds the
+    // bitstream into. Both are grow-only and dropped by the caller on error,
+    // same as the RLE buffer.
+    thread_local! {
+        static AC_OUT_BUFFER: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+        static AC_WORDS_BUFFER: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
-    let ac_packed = decode_ac_section(ac_section, &header)?;
+    let mut ac_buffer = AC_OUT_BUFFER.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    let mut ac_words_buffer =
+        AC_WORDS_BUFFER.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    let ac_len =
+        decode_ac_section_into(ac_section, &header, &mut ac_buffer, &mut ac_words_buffer)?;
+    AC_WORDS_BUFFER.with(|buffer| *buffer.borrow_mut() = ac_words_buffer);
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::AC_NS);
 
@@ -338,11 +353,12 @@ pub fn decompress(
     decode_lossy_channels(
         &channel_infos,
         &csc_groups,
-        &ac_packed,
+        &ac_buffer[..ac_len],
         &dc_packed,
         &row_offsets,
         &mut out,
     )?;
+    AC_OUT_BUFFER.with(|buffer| *buffer.borrow_mut() = ac_buffer);
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::DCT_NS);
 

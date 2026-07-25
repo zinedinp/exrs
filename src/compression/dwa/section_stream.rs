@@ -52,20 +52,36 @@ pub(super) fn decode_unknown_section(section: &[u8], header: &DwaHeader) -> Resu
 
 /// AC section: RLE DCT coefficients as u16, entropy coded with either the
 /// PIZ static Huffman coder or zlib.
-pub(super) fn decode_ac_section(section: &[u8], header: &DwaHeader) -> Result<Vec<u16>> {
+/// Expands into `out`, reusing whatever capacity it already has (see
+/// `huffman::decompress_into`), and returns how many entries were written.
+/// always `header.ac_count`. `words` is scratch space forwarded to the
+/// Huffman decoder, reused the same way.
+pub(super) fn decode_ac_section_into(
+    section: &[u8],
+    header: &DwaHeader,
+    out: &mut Vec<u16>,
+    words: &mut Vec<u64>,
+) -> Result<usize> {
     if header.ac_count == 0 {
-        return Ok(vec![]);
+        return Ok(0);
     }
 
     match header.ac_compression {
         AcCompression::StaticHuffman => {
-            crate::compression::huffman::decompress(section, header.ac_count)
+            crate::compression::huffman::decompress_into(section, header.ac_count, out, words)?;
         }
         AcCompression::Deflate => {
             let bytes = inflate(section, header.ac_count * 2)?;
-            Ok(bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect())
+            if out.len() < header.ac_count {
+                out.resize(header.ac_count, 0);
+            }
+            for (slot, pair) in out[..header.ac_count].iter_mut().zip(bytes.chunks_exact(2)) {
+                *slot = u16::from_le_bytes([pair[0], pair[1]]);
+            }
         }
     }
+
+    Ok(header.ac_count)
 }
 
 /// DC section: one u16 (half bits) per 8x8 block, zlib-compressed after
