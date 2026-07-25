@@ -22,6 +22,14 @@ pub static RLE_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 pub static RLE_UNPACK_NS: AtomicU64 = AtomicU64::new(0);
 pub static DCT_NS: AtomicU64 = AtomicU64::new(0);
 pub static ASSEMBLE_NS: AtomicU64 = AtomicU64::new(0);
+// Whole-`decompress` time and the output buffer allocation inside it, to see
+// how much of the wall time falls outside the stages above (chunk parsing,
+// channel classification, the per-chunk output allocation)
+pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+pub static OUT_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
+/// Not a duration: total bytes of output buffer allocated, reported as MiB per
+/// iteration, so the allocation volume behind `OUT_ALLOC_NS` is visible
+pub static OUT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timer(Instant);
@@ -45,6 +53,9 @@ pub fn reset() {
         &RLE_UNPACK_NS,
         &DCT_NS,
         &ASSEMBLE_NS,
+        &TOTAL_NS,
+        &OUT_ALLOC_NS,
+        &OUT_BYTES,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -56,7 +67,7 @@ pub fn report(divisor: u64) {
         counter.load(Ordering::Relaxed) as f64 / divisor.max(1) as f64 / 1_000_000.0
     };
     eprintln!(
-        "dwa-profile (avg ms/iter): unknown={:.3} ac_huffman={:.3} dc={:.3} rle={:.3} (rle_inflate={:.3} rle_alloc={:.3} rle_unpack={:.3}) lossy_dct={:.3} assemble={:.3}",
+        "dwa-profile (avg ms/iter): unknown={:.3} ac_huffman={:.3} dc={:.3} rle={:.3} (rle_inflate={:.3} rle_alloc={:.3} rle_unpack={:.3}) lossy_dct={:.3} assemble={:.3} out_alloc={:.3} total={:.3}",
         ms(&UNKNOWN_NS),
         ms(&AC_NS),
         ms(&DC_NS),
@@ -66,5 +77,11 @@ pub fn report(divisor: u64) {
         ms(&RLE_UNPACK_NS),
         ms(&DCT_NS),
         ms(&ASSEMBLE_NS),
+        ms(&OUT_ALLOC_NS),
+        ms(&TOTAL_NS),
+    );
+    eprintln!(
+        "dwa-profile: out_alloc volume = {:.1} MiB/iter",
+        OUT_BYTES.load(Ordering::Relaxed) as f64 / divisor.max(1) as f64 / (1024.0 * 1024.0),
     );
 }

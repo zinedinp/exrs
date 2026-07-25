@@ -256,6 +256,9 @@ pub fn decompress(
         );
     }
 
+    #[cfg(feature = "dwa-profile")]
+    let total = profile::start();
+
     let mut input = compressed_le.as_slice();
     let header = DwaHeader::parse(&mut input)?;
 
@@ -314,7 +317,20 @@ pub fn decompress(
     t.stop(&profile::RLE_NS);
 
     let row_offsets = compute_row_offsets(channels, &channel_infos, rectangle);
+
+    // Freshly allocated per chunk, and handed to the caller, so unlike the RLE
+    // buffer it cannot be reused here. Note that this timer sees almost none of
+    // its real cost: the zero pages are only faulted in when they are first
+    // written, which happens in the two stages below
+    #[cfg(feature = "dwa-profile")]
+    let t = profile::start();
     let mut out = vec![0u8; expected_byte_size];
+    #[cfg(feature = "dwa-profile")]
+    {
+        t.stop(&profile::OUT_ALLOC_NS);
+        profile::OUT_BYTES
+            .fetch_add(expected_byte_size as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
@@ -344,6 +360,9 @@ pub fn decompress(
     t.stop(&profile::ASSEMBLE_NS);
 
     RLE_BUFFER.with(|buffer| *buffer.borrow_mut() = rle_buffer);
+
+    #[cfg(feature = "dwa-profile")]
+    total.stop(&profile::TOTAL_NS);
 
     crate::compression::convert_little_endian_to_current(out, channels, rectangle)
 }
