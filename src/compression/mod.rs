@@ -821,7 +821,8 @@ pub(crate) fn compress_zlib(data: &[u8], level: u8) -> ByteVec {
     use flate2::{write::ZlibEncoder, Compression as ZlibCompression};
     use std::io::Write;
 
-    let mut encoder = ZlibEncoder::new(Vec::with_capacity(data.len()), ZlibCompression::new(level as u32));
+    let buffer = crate::block::pool::take_with_capacity(data.len());
+    let mut encoder = ZlibEncoder::new(buffer, ZlibCompression::new(level as u32));
     encoder.write_all(data).expect("zlib compression to memory buffer cannot fail");
     encoder.finish().expect("zlib compression to memory buffer cannot fail")
 }

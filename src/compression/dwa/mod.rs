@@ -202,7 +202,9 @@ pub fn compress(
     } else {
         let rle_tokens = super::rle::pack_rle_tokens(&rle_raw);
         let compressed = super::compress_zlib(&rle_tokens, 9);
-        (rle_tokens.len(), compressed)
+        let rle_tokens_len = rle_tokens.len();
+        crate::block::pool::recycle(rle_tokens);
+        (rle_tokens_len, compressed)
     };
 
     let header = DwaHeader {
@@ -219,7 +221,7 @@ pub fn compress(
         ac_compression,
     };
 
-    let mut out = Vec::with_capacity(
+    let mut out = crate::block::pool::take_with_capacity(
         11 * 8
             + rule_bytes.len()
             + unknown_compressed.len()
@@ -233,6 +235,16 @@ pub fn compress(
     out.extend_from_slice(&ac_compressed);
     out.extend_from_slice(&dc_compressed);
     out.extend_from_slice(&rle_compressed);
+
+    // These sub-buffers are fully copied into `out` above and dropped
+    // otherwise; hand them back to the pool here so the next chunk's
+    // `compress_zlib`/`pack_rle_tokens`/huffman calls see already-faulted
+    // pages instead of fresh ones, same reasoning as `out` itself.
+    crate::block::pool::recycle(unknown_compressed);
+    crate::block::pool::recycle(ac_compressed);
+    crate::block::pool::recycle(dc_compressed);
+    crate::block::pool::recycle(rle_compressed);
+
     Ok(out)
 }
 

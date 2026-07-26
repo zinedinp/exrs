@@ -1,4 +1,5 @@
-//! Reuse of the byte buffers that decompressed blocks are handed out in.
+//! Reuse of the byte buffers that decompressed blocks are handed out in, and of
+//! the compressed-chunk output buffers produced while writing.
 //!
 //! Every decompressed chunk gets a fresh output buffer, which is dropped again
 //! as soon as the reader has copied the samples out of it. On a 4k DWA image
@@ -15,7 +16,15 @@
 //! once it is done with it. Everything is a plain `Vec<u8>`, so a reader that
 //! does not recycle simply drops the buffer, as before.
 //!
-//! Buffers are only ever retained once a decompressor has actually asked for
+//! The write side has the same shape in reverse: every compressed chunk (and,
+//! for multi-section formats like DWA, every section inside it) is built into
+//! its own freshly allocated `Vec<u8>` that lives only until its bytes have
+//! been copied into the file or into the next buffer up the chain, then it is
+//! dropped. `take_with_capacity`/`recycle` let compressors pull a
+//! previously-used buffer's pages back instead of faulting in new ones for
+//! every chunk.
+//!
+//! Buffers are only ever retained once something has actually asked for
 //! one, so an image whose compression method does not use the pool never makes
 //! it hold on to memory.
 
@@ -65,10 +74,30 @@ pub fn take_zeroed(size: usize) -> Vec<u8> {
     }
 }
 
-/// Offer a block's buffer to the next decompression that needs one, instead of
-/// dropping it. Call this only with a buffer that is no longer referenced,
-/// typically `block.data` at the end of a `read_block` implementation.
-/// Buffers beyond what the pool retains are dropped as usual.
+/// An empty buffer with at least `min_capacity` bytes of capacity, reusing a
+/// previously recycled allocation where one is large enough, and allocating
+/// otherwise. Unlike `take_zeroed`, the buffer is not resized or zeroed, so
+/// callers that grow it themselves (`Write::write_all`, `extend_from_slice`,
+/// `push`) start writing into pages that were already faulted
+pub fn take_with_capacity(min_capacity: usize) -> Vec<u8> {
+    POOL_IS_USED.store(true, Ordering::Relaxed);
+
+    let recycled = {
+        let mut pool = lock_pool();
+        pool.iter()
+            .position(|buffer| buffer.capacity() >= min_capacity)
+            .map(|index| pool.swap_remove(index))
+    };
+
+    // buffers are always stored cleared (`recycle`), so no `clear()` needed here
+    recycled.unwrap_or_else(|| Vec::with_capacity(min_capacity))
+}
+
+/// Offer a block's buffer to the next decompression or compression that
+/// needs one, instead of dropping it. Call this only with a buffer that is no
+/// longer referenced, typically `block.data` at the end of a `read_block`
+/// implementation, or a compressed chunk's bytes once they have been written
+/// out. Buffers beyond what the pool retains are dropped as usual.
 pub fn recycle(mut buffer: Vec<u8>) {
     if buffer.capacity() == 0 || !POOL_IS_USED.load(Ordering::Relaxed) {
         return;

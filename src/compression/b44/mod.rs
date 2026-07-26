@@ -582,7 +582,8 @@ pub fn compress(
 
     // Generate a whole buffer that we will crop to proper size once compression is
     // done.
-    let mut b44_compressed = vec![0; std::cmp::max(2048, uncompressed_le.len())];
+    let mut b44_compressed =
+        crate::block::pool::take_zeroed(std::cmp::max(2048, uncompressed_le.len()));
     let mut b44_end = 0; // Buffer byte index for storing next compressed values.
 
     for channel in &channel_data {

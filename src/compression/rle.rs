@@ -108,7 +108,7 @@ pub fn compress_bytes(
 /// the byte-oriented RLE token stream; callers are responsible for any byte
 /// prediction, byte interleaving, or zlib wrapping required by their format.
 pub(super) fn pack_rle_tokens(data_le: &[u8]) -> ByteVec {
-    let mut compressed_le = Vec::with_capacity(data_le.len());
+    let mut compressed_le = crate::block::pool::take_with_capacity(data_le.len());
     let mut run_start = 0;
     let mut run_end = 1;
 
