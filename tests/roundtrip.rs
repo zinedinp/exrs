@@ -332,6 +332,65 @@ fn roundtrip_unusual_7() -> UnitResult {
     Ok(())
 }
 
+// Regression test for a bug where `collect_pixels_in_parallel`'s fast path
+// mistook tiled files for scanline files: it tracked a single forward-moving
+// row cursor, but tiled chunks legitimately repeat the same `y` (one chunk
+// per tile column in a tile row), so the second tile in a row tripped the
+// cursor's `y < cursor` sanity check with `Invalid("chunk row range")`. Reads
+// every real tiled test image in the repository through
+// `collect_pixels_in_parallel` and checks the result against the known-good
+// `.non_parallel()`
+#[test]
+fn roundtrip_tiled_files_in_parallel() {
+    let tiled_files: Vec<PathBuf> = walkdir::WalkDir::new("tests/images/valid/openexr/Tiles")
+        .into_iter()
+        .map(std::result::Result::unwrap)
+        .filter(|entry| entry.path().extension() == Some(OsStr::new("exr")))
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+
+    assert!(!tiled_files.is_empty(), "no tiled test images found");
+
+    for path in tiled_files {
+        let file = std::fs::read(&path).expect("cannot open file");
+
+        let reader = read()
+            .no_deep_data()
+            .largest_resolution_level()
+            .specific_channels()
+            .required("R")
+            .required("G")
+            .required("B")
+            .optional("A", 1.0_f32)
+            .collect_pixels_in_parallel(
+                |resolution, _channels| FlatRowMajorPixelStorage {
+                    width: resolution.width(),
+                    pixels: vec![[0.0_f32; 4]; resolution.width() * resolution.height()],
+                },
+                |row: &mut [[f32; 4]], x, (r, g, b, a): (f32, f32, f32, f32)| {
+                    row[x] = [r, g, b, a];
+                },
+            )
+            .first_valid_layer()
+            .all_attributes();
+
+        let parallel = reader.clone().from_buffered(Cursor::new(&file)).unwrap_or_else(|error| {
+            panic!("parallel read of {:?} failed: {:?}", path, error)
+        });
+
+        let serial = reader.non_parallel().from_buffered(Cursor::new(&file)).unwrap_or_else(|error| {
+            panic!("serial read of {:?} failed: {:?}", path, error)
+        });
+
+        assert_eq!(
+            parallel.layer_data.channel_data.pixels.pixels,
+            serial.layer_data.channel_data.pixels.pixels,
+            "parallel and serial reads disagree on {:?}",
+            path
+        );
+    }
+}
+
 #[test]
 fn roundtrip_pxr24() {
     test_mixed_roundtrip_with_compression(Compression::PXR24)

@@ -515,7 +515,15 @@ where
         let width = header.layer_size.width();
         let bytes_per_pixel = header.channels.bytes_per_pixel;
 
-        if header.line_order == crate::meta::attribute::LineOrder::Decreasing {
+        // The fast path below tracks a single forward-moving row cursor,
+        // assuming every incoming chunk is a scanline band strictly below the
+        // previous one. True for `LineOrder::Increasing`/`Unspecified`
+        // scanline files, but not for tiled files, where several chunks
+        // legitimately share the same `y` (one per tile column in a tile
+        // row) and are narrower than `width`. Both cases fall back to
+        // `read_block`.
+        let is_tiled = !matches!(header.blocks, crate::meta::BlockDescription::ScanLines);
+        if header.line_order == crate::meta::attribute::LineOrder::Decreasing || is_tiled {
             while let Some(chunk) = chunks.next() {
                 let block = UncompressedBlock::decompress_chunk(chunk?, meta_data, pedantic)?;
                 self.read_block(header, block)?;
