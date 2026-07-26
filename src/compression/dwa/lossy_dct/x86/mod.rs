@@ -17,12 +17,15 @@ use std::convert::TryInto;
 
 use half::f16;
 use pulp::core_arch::x86::F16c;
-use pulp::x86::V3;
+use pulp::x86::{V3, V4};
 
 use crate::{
     compression::dwa::{
         color_space_conversion,
-        discrete_cosine_transform::{self, x86::avx2 as dct_avx2},
+        discrete_cosine_transform::{
+            self,
+            x86::{avx2 as dct_avx2, avx512 as dct_avx512},
+        },
     },
     error::{Error, Result as ExrResult},
     meta::attribute::SampleType,
@@ -37,6 +40,102 @@ pub(super) fn try_from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) -> 
     } else {
         false
     }
+}
+
+/// Un-RLE + un-zigzag one spatial block into `dct_blocks`. `needs_inverse`
+/// tracks which components still need a real iDCT vs. already being filled
+/// in by the DC-only fast path. Shared by the AVX2 and AVX-512 fused paths.
+#[inline(always)]
+fn zigzag_block(
+    v3: V3,
+    f16c: F16c,
+    ac: &mut PackedStream<'_>,
+    dc: &mut PackedStream<'_>,
+    components: usize,
+    block_count: usize,
+    block_index: usize,
+    dct_blocks: &mut [[f32; 64]; 3],
+    needs_inverse: &mut [bool; 3],
+) -> ExrResult<()> {
+    for component in 0..components {
+        let mut zig_block = [0u16; 64];
+        zig_block[0] = match dc.peek_at(component * block_count + block_index) {
+            Some(v) => v,
+            None => return Err(Error::invalid("truncated DWA DC data")),
+        };
+
+        let last_non_zero = un_rle_ac(ac, &mut zig_block)?;
+
+        let dct_block = &mut dct_blocks[component];
+        if last_non_zero == 0 {
+            dct_block[0] = f16::from_bits(zig_block[0]).to_f32();
+            discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
+            needs_inverse[component] = false;
+        } else {
+            // Tokens already probed above; call the kernel directly.
+            from_half_zigzag(v3, f16c, &zig_block, dct_block);
+            needs_inverse[component] = true;
+        }
+    }
+    Ok(())
+}
+
+/// Write one already-inverted (and, if 3 components, already CSC'd) spatial
+/// block to its scanline target(s). Shared the same way as `zigzag_block`.
+#[inline(always)]
+fn write_block(
+    v3: V3,
+    f16c: F16c,
+    block_x: usize,
+    block_y: usize,
+    x_count: usize,
+    y_count: usize,
+    to_linear: Option<&[u16; 65536]>,
+    dct_blocks: &[[f32; 64]; 3],
+    targets: &mut [ScanlineTarget<'_>],
+    out: &mut [u8],
+) -> Option<Error> {
+    for (component, target) in targets.iter_mut().enumerate() {
+        let block = &dct_blocks[component];
+        let bytes_per_sample = target.sample_type.bytes_per_sample();
+        for dy in 0..y_count {
+            let y = block_y * 8 + dy;
+            let row = &block[dy * 8..dy * 8 + x_count];
+            let offset = target.row_offsets[y] + block_x * 8 * bytes_per_sample;
+            let out_row = &mut out[offset..][..x_count * bytes_per_sample];
+
+            let handled = match target.sample_type {
+                SampleType::F16 => write_row_f16_tokens(v3, f16c, row, to_linear, out_row),
+                SampleType::F32 => write_row_f32_tokens(v3, f16c, row, to_linear, out_row),
+                SampleType::U32 => false,
+            };
+            if handled {
+                continue;
+            }
+
+            // Edge blocks (x_count < 8) or U32 -> scalar fallback.
+            match target.sample_type {
+                SampleType::F16 => {
+                    for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row) {
+                        let linear = linearize_scalar(value, to_linear);
+                        chunk.copy_from_slice(&linear.to_bits().to_le_bytes());
+                    }
+                }
+                SampleType::F32 => {
+                    for (chunk, &value) in out_row.chunks_exact_mut(4).zip(row) {
+                        let linear = linearize_scalar(value, to_linear);
+                        chunk.copy_from_slice(&linear.to_f32().to_le_bytes());
+                    }
+                }
+                SampleType::U32 => {
+                    return Some(Error::unsupported(
+                        "DWA lossy DCT compression of u32 channels",
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// for each spatial 8x8, finish
@@ -65,8 +164,8 @@ pub(super) fn try_decode_group_fused(
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
 
-    // One spatial block's components. 3 × 256 B = 768 B — stays in L1 for the
-    // whole unRLE→write pipeline of that block (OpenEXR's shape).
+    // One spatial block's components. 3 × 256 B = 768 B -> stays in L1 for the
+    // whole unRLE -> write pipeline of that block (OpenEXR's shape).
     let mut dct_blocks = [[0.0f32; 64]; 3];
     let mut needs_inverse = [false; 3];
 
@@ -76,28 +175,18 @@ pub(super) fn try_decode_group_fused(
             let block_index = block_y * blocks_x + block_x;
             let x_count = 8.min(width - block_x * 8);
 
-            for component in 0..components {
-                let mut zig_block = [0u16; 64];
-                zig_block[0] = match dc.peek_at(component * block_count + block_index) {
-                    Some(v) => v,
-                    None => return Some(Err(Error::invalid("truncated DWA DC data"))),
-                };
-
-                let last_non_zero = match un_rle_ac(ac, &mut zig_block) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                };
-
-                let dct_block = &mut dct_blocks[component];
-                if last_non_zero == 0 {
-                    dct_block[0] = f16::from_bits(zig_block[0]).to_f32();
-                    discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
-                    needs_inverse[component] = false;
-                } else {
-                    // Tokens already probed above; call the kernel directly.
-                    from_half_zigzag(v3, f16c, &zig_block, dct_block);
-                    needs_inverse[component] = true;
-                }
+            if let Err(e) = zigzag_block(
+                v3,
+                f16c,
+                ac,
+                dc,
+                components,
+                block_count,
+                block_index,
+                &mut dct_blocks,
+                &mut needs_inverse,
+            ) {
+                return Some(Err(e));
             }
 
             // One trampoline for this spatial block: iDCT every component that
@@ -116,55 +205,187 @@ pub(super) fn try_decode_group_fused(
                     color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_blocks);
                 }
 
-                for (component, target) in targets.iter_mut().enumerate() {
-                    let block = &dct_blocks[component];
-                    let bytes_per_sample = target.sample_type.bytes_per_sample();
-                    for dy in 0..y_count {
-                        let y = block_y * 8 + dy;
-                        let row = &block[dy * 8..dy * 8 + x_count];
-                        let offset = target.row_offsets[y] + block_x * 8 * bytes_per_sample;
-                        let out_row = &mut out[offset..][..x_count * bytes_per_sample];
-
-                        let handled = match target.sample_type {
-                            SampleType::F16 => {
-                                write_row_f16_tokens(v3, f16c, row, to_linear, out_row)
-                            }
-                            SampleType::F32 => {
-                                write_row_f32_tokens(v3, f16c, row, to_linear, out_row)
-                            }
-                            SampleType::U32 => false,
-                        };
-                        if handled {
-                            continue;
-                        }
-
-                        // Edge blocks (x_count < 8) or U32: scalar fallback.
-                        match target.sample_type {
-                            SampleType::F16 => {
-                                for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row) {
-                                    let linear = linearize_scalar(value, to_linear);
-                                    chunk.copy_from_slice(&linear.to_bits().to_le_bytes());
-                                }
-                            }
-                            SampleType::F32 => {
-                                for (chunk, &value) in out_row.chunks_exact_mut(4).zip(row) {
-                                    let linear = linearize_scalar(value, to_linear);
-                                    chunk.copy_from_slice(&linear.to_f32().to_le_bytes());
-                                }
-                            }
-                            SampleType::U32 => {
-                                write_err = Some(Error::unsupported(
-                                    "DWA lossy DCT compression of u32 channels",
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                }
+                write_err = write_block(
+                    v3, f16c, block_x, block_y, x_count, y_count, to_linear, &dct_blocks, targets,
+                    out,
+                );
             });
             if let Some(err) = write_err {
                 return Some(Err(err));
             }
+        }
+    }
+
+    dc.advance(components * block_count);
+    Some(Ok(()))
+}
+
+// `v4_fn!` instead of `V4::vectorize`: this body calls `dct_avx512::inverse_pair`,
+// which bottoms out in `recombine` -- the function whose codegen silently
+// degraded ~50x under the closure trampoline (LLVM's optional inlining pass
+// declined to merge it). `v4_fn!` pastes the body directly inside a
+// `#[target_feature]` function instead, guaranteeing real AVX-512 codegen.
+pulp::v4_fn! {
+    fn decode_pair_dct_csc(
+        v4: V4,
+        v3: V3,
+        components: usize,
+        needs_a: [bool; 3],
+        needs_b: [bool; 3],
+        dct_a: &mut [[f32; 64]; 3],
+        dct_b: &mut [[f32; 64]; 3],
+    ) {
+        let coef2 = dct_avx2::Coefficients::new(v3);
+        let coef4 = dct_avx512::Coefficients::new(v4);
+        for component in 0..components {
+            match (needs_a[component], needs_b[component]) {
+                (true, true) => {
+                    dct_avx512::inverse_pair(
+                        v4,
+                        &coef4,
+                        &mut dct_a[component],
+                        &mut dct_b[component],
+                    );
+                }
+                (true, false) => {
+                    dct_avx2::inverse_one(v3, &coef2, &mut dct_a[component]);
+                }
+                (false, true) => {
+                    dct_avx2::inverse_one(v3, &coef2, &mut dct_b[component]);
+                }
+                (false, false) => {}
+            }
+        }
+
+        if components == 3 {
+            color_space_conversion::x86::avx512::inverse_pair(v4, dct_a, dct_b);
+        }
+    }
+}
+
+/// AVX-512 analog of `try_decode_group_fused`: same fused shape, but the
+/// DCT/CSC step processes 2 spatial blocks at once (one 512-bit register per
+/// step). Zigzag and write stay on the single-block AVX2+F16C kernels.
+///
+/// If only one block of a pair is DC-only, that component skips the paired
+/// kernel (it would re-run iDCT over already-final spatial data) and falls
+/// back to the single-block AVX2 kernel instead. An odd trailing block also
+/// falls back to `try_decode_group_fused`'s single-block body.
+///
+/// Returns `None` without AVX-512 or F16C; caller then tries the AVX2 fused
+/// path, then the strip-tiled fallback.
+pub(super) fn try_decode_group_fused_avx512(
+    ac: &mut PackedStream<'_>,
+    dc: &mut PackedStream<'_>,
+    width: usize,
+    height: usize,
+    to_linear: Option<&[u16; 65536]>,
+    targets: &mut [ScanlineTarget<'_>],
+    out: &mut [u8],
+) -> Option<ExrResult<()>> {
+    let Some(v4) = V4::try_new() else {
+        return None;
+    };
+    let Some(f16c) = F16c::try_new() else {
+        return None;
+    };
+    let v3: V3 = *v4;
+
+    let components = targets.len();
+    if components != 1 && components != 3 {
+        return Some(Err(Error::invalid("invalid DWA lossy component count")));
+    }
+
+    let blocks_x = (width + 7) / 8;
+    let blocks_y = (height + 7) / 8;
+    let block_count = blocks_x * blocks_y;
+
+    let mut dct_a = [[0.0f32; 64]; 3];
+    let mut dct_b = [[0.0f32; 64]; 3];
+    let mut needs_a = [false; 3];
+    let mut needs_b = [false; 3];
+
+    let mut block_index = 0usize;
+    while block_index < block_count {
+        let block_x0 = block_index % blocks_x;
+        let block_y0 = block_index / blocks_x;
+        let x_count0 = 8.min(width - block_x0 * 8);
+        let y_count0 = 8.min(height - block_y0 * 8);
+
+        if let Err(e) = zigzag_block(
+            v3,
+            f16c,
+            ac,
+            dc,
+            components,
+            block_count,
+            block_index,
+            &mut dct_a,
+            &mut needs_a,
+        ) {
+            return Some(Err(e));
+        }
+
+        let next_index = block_index + 1;
+        if next_index < block_count {
+            let block_x1 = next_index % blocks_x;
+            let block_y1 = next_index / blocks_x;
+            let x_count1 = 8.min(width - block_x1 * 8);
+            let y_count1 = 8.min(height - block_y1 * 8);
+
+            if let Err(e) = zigzag_block(
+                v3,
+                f16c,
+                ac,
+                dc,
+                components,
+                block_count,
+                next_index,
+                &mut dct_b,
+                &mut needs_b,
+            ) {
+                return Some(Err(e));
+            }
+
+            decode_pair_dct_csc(v4, v3, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
+
+            let mut write_err =
+                write_block(v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out);
+            if write_err.is_none() {
+                write_err = write_block(
+                    v3, f16c, block_x1, block_y1, x_count1, y_count1, to_linear, &dct_b, targets, out,
+                );
+            }
+            if let Some(err) = write_err {
+                return Some(Err(err));
+            }
+
+            block_index += 2;
+        } else {
+            // Odd trailing block: not worth a 2-block kernel for one block.
+            let mut write_err: Option<Error> = None;
+            v3.vectorize(|| {
+                let coef = dct_avx2::Coefficients::new(v3);
+                for component in 0..components {
+                    if needs_a[component] {
+                        dct_avx2::inverse_one(v3, &coef, &mut dct_a[component]);
+                    }
+                }
+
+                if components == 3 {
+                    color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_a);
+                }
+
+                write_err = write_block(
+                    v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets,
+                    out,
+                );
+            });
+            if let Some(err) = write_err {
+                return Some(Err(err));
+            }
+
+            block_index += 1;
         }
     }
 

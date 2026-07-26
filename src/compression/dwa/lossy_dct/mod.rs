@@ -347,10 +347,20 @@ fn decode_lossy_dct_group(
     targets: &mut [ScanlineTarget<'_>],
     out: &mut [u8],
 ) -> Result<()> {
-    // Prefer the fused per-block path on AVX2+F16C hosts: one spatial 8x8
-    // (or RGB triplet) finishes unRLE->iDCT->CSC->write while its ~1 KiB
-    // working set is still L1-hot, matching OpenEXR's LossyDctDecoder shape
-    // more closely than the strip-tiled multi-pass fallback below.
+    // Prefer the AVX-512 (V4) fused path when available: same fused shape as
+    // the AVX2 path below, but the DCT/CSC middle step processes 2 spatial
+    // blocks at once through 512-bit registers (see `try_decode_group_fused_avx512`).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if let Some(result) =
+        x86::try_decode_group_fused_avx512(ac, dc, width, height, to_linear, targets, out)
+    {
+        return result;
+    }
+
+    // Otherwise, prefer the fused per-block path on AVX2+F16C hosts: one
+    // spatial 8x8 (or RGB triplet) finishes unRLE->iDCT->CSC->write while its
+    // ~1 KiB working set is still L1-hot, matching OpenEXR's LossyDctDecoder
+    // shape more closely than the strip-tiled multi-pass fallback below.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(result) =
         x86::try_decode_group_fused(ac, dc, width, height, to_linear, targets, out)
