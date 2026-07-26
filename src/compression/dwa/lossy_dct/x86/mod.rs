@@ -2,13 +2,28 @@
 // `fromHalfZigZag_f16c` (internal_dwa_simd.h): a fixed shuffle network instead
 // of a scalar gather, then F16C to widen the halves to f32.
 //
-// Needs the `V3` tier (for its SSE2/SSSE3/SSE4.1 tokens) and `F16c`; if either
-// is missing, the caller falls back to the scalar path.
+// Also hosts the fused per-block decode path (`try_decode_group_fused`): one
+// spatial 8x8 (or RGB triplet) runs unRLE -> zigzag -> iDCT -> CSC -> write while
+// the ~1 KiB working set stays L1-hot, instead of four passes over a wide
+// strip tile. Needs the `V3` tier and `F16c`; if either is missing, the
+// caller falls back to the strip-tiled path.
 
 use std::convert::TryInto;
 
+use half::f16;
 use pulp::core_arch::x86::F16c;
 use pulp::x86::V3;
+
+use crate::{
+    compression::dwa::{
+        color_space_conversion,
+        discrete_cosine_transform::{self, x86::avx2 as dct_avx2},
+    },
+    error::{Error, Result as ExrResult},
+    meta::attribute::SampleType,
+};
+
+use super::{quantization::un_rle_ac, PackedStream, ScanlineTarget};
 
 pub(super) fn try_from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) -> bool {
     if let (Some(v3), Some(f16c)) = (V3::try_new(), F16c::try_new()) {
@@ -17,6 +32,199 @@ pub(super) fn try_from_half_zigzag(zig_zag: &[u16; 64], dst: &mut [f32; 64]) -> 
     } else {
         false
     }
+}
+
+/// for each spatial 8x8, finish
+/// unRLE -> zigzag -> iDCT -> CSC -> scanline write before touching the next
+/// block. Returns `None` when the host lacks AVX2+F16C (caller uses the
+/// strip-tiled path). Returns `Some(result)`
+pub(super) fn try_decode_group_fused(
+    ac: &mut PackedStream<'_>,
+    dc: &mut PackedStream<'_>,
+    width: usize,
+    height: usize,
+    to_linear: Option<&[u16; 65536]>,
+    targets: &mut [ScanlineTarget<'_>],
+    out: &mut [u8],
+) -> Option<ExrResult<()>> {
+    let (Some(v3), Some(f16c)) = (V3::try_new(), F16c::try_new()) else {
+        return None;
+    };
+
+    let components = targets.len();
+    if components != 1 && components != 3 {
+        return Some(Err(Error::invalid("invalid DWA lossy component count")));
+    }
+
+    let blocks_x = (width + 7) / 8;
+    let blocks_y = (height + 7) / 8;
+    let block_count = blocks_x * blocks_y;
+
+    // One spatial block's components. 3 × 256 B = 768 B — stays in L1 for the
+    // whole unRLE→write pipeline of that block (OpenEXR's shape).
+    let mut dct_blocks = [[0.0f32; 64]; 3];
+    let mut needs_inverse = [false; 3];
+
+    for block_y in 0..blocks_y {
+        let y_count = 8.min(height - block_y * 8);
+        for block_x in 0..blocks_x {
+            let block_index = block_y * blocks_x + block_x;
+            let x_count = 8.min(width - block_x * 8);
+
+            for component in 0..components {
+                let mut zig_block = [0u16; 64];
+                zig_block[0] = match dc.peek_at(component * block_count + block_index) {
+                    Some(v) => v,
+                    None => return Some(Err(Error::invalid("truncated DWA DC data"))),
+                };
+
+                let last_non_zero = match un_rle_ac(ac, &mut zig_block) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+
+                let dct_block = &mut dct_blocks[component];
+                if last_non_zero == 0 {
+                    dct_block[0] = f16::from_bits(zig_block[0]).to_f32();
+                    discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
+                    needs_inverse[component] = false;
+                } else {
+                    // Tokens already probed above; call the kernel directly.
+                    from_half_zigzag(v3, f16c, &zig_block, dct_block);
+                    needs_inverse[component] = true;
+                }
+            }
+
+            // One trampoline for this spatial block: iDCT every component that
+            // needs it, optional CSC, then write. Keeps the 768 B block set hot
+            // end-to-end instead of reloading a multi-block strip four times.
+            let mut write_err: Option<Error> = None;
+            v3.vectorize(|| {
+                let coef = dct_avx2::Coefficients::new(v3);
+                for component in 0..components {
+                    if needs_inverse[component] {
+                        dct_avx2::inverse_one(v3, &coef, &mut dct_blocks[component]);
+                    }
+                }
+
+                if components == 3 {
+                    color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_blocks);
+                }
+
+                for (component, target) in targets.iter_mut().enumerate() {
+                    let block = &dct_blocks[component];
+                    let bytes_per_sample = target.sample_type.bytes_per_sample();
+                    for dy in 0..y_count {
+                        let y = block_y * 8 + dy;
+                        let row = &block[dy * 8..dy * 8 + x_count];
+                        let offset = target.row_offsets[y] + block_x * 8 * bytes_per_sample;
+                        let out_row = &mut out[offset..][..x_count * bytes_per_sample];
+
+                        let handled = match target.sample_type {
+                            SampleType::F16 => {
+                                write_row_f16_tokens(v3, f16c, row, to_linear, out_row)
+                            }
+                            SampleType::F32 => {
+                                write_row_f32_tokens(v3, f16c, row, to_linear, out_row)
+                            }
+                            SampleType::U32 => false,
+                        };
+                        if handled {
+                            continue;
+                        }
+
+                        // Edge blocks (x_count < 8) or U32: scalar fallback.
+                        match target.sample_type {
+                            SampleType::F16 => {
+                                for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row) {
+                                    let linear = linearize_scalar(value, to_linear);
+                                    chunk.copy_from_slice(&linear.to_bits().to_le_bytes());
+                                }
+                            }
+                            SampleType::F32 => {
+                                for (chunk, &value) in out_row.chunks_exact_mut(4).zip(row) {
+                                    let linear = linearize_scalar(value, to_linear);
+                                    chunk.copy_from_slice(&linear.to_f32().to_le_bytes());
+                                }
+                            }
+                            SampleType::U32 => {
+                                write_err = Some(Error::unsupported(
+                                    "DWA lossy DCT compression of u32 channels",
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+            if let Some(err) = write_err {
+                return Some(Err(err));
+            }
+        }
+    }
+
+    dc.advance(components * block_count);
+    Some(Ok(()))
+}
+
+#[inline(always)]
+fn linearize_scalar(value: f32, to_linear: Option<&[u16; 65536]>) -> f16 {
+    let nonlinear = f16::from_f32(value);
+    match to_linear {
+        Some(table) => f16::from_bits(table[nonlinear.to_bits() as usize]),
+        None => nonlinear,
+    }
+}
+
+#[inline(always)]
+fn write_row_f16_tokens(
+    v3: V3,
+    f16c: F16c,
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
+        return false;
+    };
+    if out_row.len() != 16 {
+        return false;
+    }
+    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
+    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
+    let linear = match to_linear {
+        Some(table) => linearize_lanes(v3, nonlinear, table),
+        None => nonlinear,
+    };
+    let bytes: [u8; 16] = pulp::cast!(linear);
+    out_row.copy_from_slice(&bytes);
+    true
+}
+
+#[inline(always)]
+fn write_row_f32_tokens(
+    v3: V3,
+    f16c: F16c,
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
+        return false;
+    };
+    if out_row.len() != 32 {
+        return false;
+    }
+    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
+    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
+    let linear = match to_linear {
+        Some(table) => linearize_lanes(v3, nonlinear, table),
+        None => nonlinear,
+    };
+    let widened = f16c._mm256_cvtph_ps(linear);
+    let bytes: [u8; 32] = pulp::cast!(widened);
+    out_row.copy_from_slice(&bytes);
+    true
 }
 
 // Rounding-mode immediate for `vcvtps2ph`: `_MM_FROUND_TO_NEAREST_INT` (0).

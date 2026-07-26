@@ -61,7 +61,10 @@ const E: f32 = 2.777855e-1;
 const F: f32 = 1.913422e-1;
 const G: f32 = 9.754573e-2;
 
-struct Coefficients {
+// Public to the crate so the fused lossy-DCT decode path can build the
+// constants once per `vectorize` trampoline and reuse them across every
+// block's in-register iDCT (see `inverse_one`).
+pub(crate) struct Coefficients {
     a: f32x8,
     na: f32x8,
     b: f32x8,
@@ -84,7 +87,7 @@ impl Coefficients {
     // instructions; LLVM inlining heuristics aren't reliable
     // enough to guarantee that on their own
     #[inline(always)]
-    fn new(v3: V3) -> Self {
+    pub(crate) fn new(v3: V3) -> Self {
         // Negated splats are exact (sign flip), so "x * na == -(x * a)".
         Self {
             a: v3.splat_f32x8(A),
@@ -197,69 +200,56 @@ pub fn dct_inverse_8x8(v3: V3, data: &mut [f32; 64]) {
 // is what lets that closures body inline and fuse into avx2
 // instructions.
 //
-// `vectorize` also has fixed overhead per call (an indirect call
-// through its register-passing trampoline, plus a feature-cache check)
+// One 8x8 inverse DCT. Must be called from inside a `V3::vectorize`
+// trampoline (or another `#[target_feature(enable = "avx2,fma")]` body)
+// so the ops lower to AVX2; the fused decode path relies on that.
+//
+// Full iDCT stays in registers: load 8 rows -> transpose to the column-major
+// shape row_pass wants -> row_pass -> transpose back to rows for column_pass
+// -> column_pass -> store. Scatter-storing the row-pass result and reloading
+// it was pure intermediate L1 traffic for a 256-byte block that already
+// fits in registers.
+#[inline(always)]
+pub(crate) fn inverse_one(v3: V3, coef: &Coefficients, data: &mut [f32; 64]) {
+    let rows: [f32x8; 8] = std::array::from_fn(|row| {
+        let b = row * 8;
+        f32x8(
+            data[b],
+            data[b + 1],
+            data[b + 2],
+            data[b + 3],
+            data[b + 4],
+            data[b + 5],
+            data[b + 6],
+            data[b + 7],
+        )
+    });
+    let columns = transpose8x8(v3, rows);
+    let row_pass_out = row_pass(v3, &coef, columns);
+    // row_pass_out[col].lane[row] = intermediate[row][col]; the 8x8
+    // transpose is an involution, so one more pass yields
+    // intermediate_rows[row].lane[col] for column_pass.
+    let intermediate_rows = transpose8x8(v3, row_pass_out);
+    let columns_out = column_pass(v3, &coef, intermediate_rows);
+    for (row, result) in columns_out.iter().enumerate() {
+        let b = row * 8;
+        data[b] = result.0;
+        data[b + 1] = result.1;
+        data[b + 2] = result.2;
+        data[b + 3] = result.3;
+        data[b + 4] = result.4;
+        data[b + 5] = result.5;
+        data[b + 6] = result.6;
+        data[b + 7] = result.7;
+    }
+}
+
+// `vectorize` fixed overhead per call
 pub fn dct_inverse_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
     v3.vectorize(move || {
         let coef = Coefficients::new(v3);
-
         for data in blocks {
-            // Row pass: needs lane i = row i's column-k values, but each row
-            // of `data` is itself contiguous, so load 8 contiguous rows and
-            // transpose them into columns in registers rather than gathering
-            // strided scalars directly (see `transpose8x8`).
-            let rows: [f32x8; 8] = std::array::from_fn(|row| {
-                let b = row * 8;
-                f32x8(
-                    data[b],
-                    data[b + 1],
-                    data[b + 2],
-                    data[b + 3],
-                    data[b + 4],
-                    data[b + 5],
-                    data[b + 6],
-                    data[b + 7],
-                )
-            });
-            let columns = transpose8x8(v3, rows);
-
-            let rows_out = row_pass(v3, &coef, columns);
-            for (column, result) in rows_out.iter().enumerate() {
-                let r = [
-                    result.0, result.1, result.2, result.3, result.4, result.5, result.6, result.7,
-                ];
-                for (row, value) in r.iter().enumerate() {
-                    data[row * 8 + column] = *value;
-                }
-            }
-
-            // Column pass: lane i = column i, each row already contiguous.
-            let rows: [f32x8; 8] = std::array::from_fn(|row| {
-                let b = row * 8;
-                f32x8(
-                    data[b],
-                    data[b + 1],
-                    data[b + 2],
-                    data[b + 3],
-                    data[b + 4],
-                    data[b + 5],
-                    data[b + 6],
-                    data[b + 7],
-                )
-            });
-
-            let columns_out = column_pass(v3, &coef, rows);
-            for (row, result) in columns_out.iter().enumerate() {
-                let b = row * 8;
-                data[b] = result.0;
-                data[b + 1] = result.1;
-                data[b + 2] = result.2;
-                data[b + 3] = result.3;
-                data[b + 4] = result.4;
-                data[b + 5] = result.5;
-                data[b + 6] = result.6;
-                data[b + 7] = result.7;
-            }
+            inverse_one(v3, &coef, data);
         }
     });
 }

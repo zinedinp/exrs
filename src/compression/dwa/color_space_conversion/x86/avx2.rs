@@ -73,33 +73,41 @@ pub fn csc709_inverse_8x8(v3: V3, block: &mut [[f32; 64]; 3]) {
     csc709_inverse_8x8_batch(v3, std::iter::once(block));
 }
 
+/// One 8x8 inverse CSC. Must run inside a `V3::vectorize` trampoline so the
+/// ops lower to AVX2; the fused lossy-DCT decode path calls this per spatial
+/// block while the three component buffers are still L1-hot.
+#[inline(always)]
+pub(crate) fn inverse_one(v3: V3, block: &mut [[f32; 64]; 3]) {
+    let c_ry = v3.splat_f32x8(1.5747);
+    let c_by_g = v3.splat_f32x8(0.1873);
+    let c_ry_g = v3.splat_f32x8(0.4682);
+    let c_by = v3.splat_f32x8(1.8556);
+
+    let mul = |a, b| v3.mul_f32x8(a, b);
+    let add = |a, b| v3.add_f32x8(a, b);
+    let sub = |a, b| v3.sub_f32x8(a, b);
+
+    let [comp0, comp1, comp2] = block;
+    for chunk in 0..8 {
+        let base = chunk * 8;
+        let y = load(v3, comp0, base);
+        let by = load(v3, comp1, base);
+        let ry = load(v3, comp2, base);
+
+        let r = add(y, mul(ry, c_ry));
+        let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
+        let b = add(y, mul(by, c_by));
+
+        store(comp0, base, r);
+        store(comp1, base, g);
+        store(comp2, base, b);
+    }
+}
+
 pub fn csc709_inverse_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
     v3.vectorize(move || {
-        let c_ry = v3.splat_f32x8(1.5747);
-        let c_by_g = v3.splat_f32x8(0.1873);
-        let c_ry_g = v3.splat_f32x8(0.4682);
-        let c_by = v3.splat_f32x8(1.8556);
-
-        let mul = |a, b| v3.mul_f32x8(a, b);
-        let add = |a, b| v3.add_f32x8(a, b);
-        let sub = |a, b| v3.sub_f32x8(a, b);
-
         for block in blocks {
-            let [comp0, comp1, comp2] = block;
-            for chunk in 0..8 {
-                let base = chunk * 8;
-                let y = load(v3, comp0, base);
-                let by = load(v3, comp1, base);
-                let ry = load(v3, comp2, base);
-
-                let r = add(y, mul(ry, c_ry));
-                let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
-                let b = add(y, mul(by, c_by));
-
-                store(comp0, base, r);
-                store(comp1, base, g);
-                store(comp2, base, b);
-            }
+            inverse_one(v3, block);
         }
     });
 }
