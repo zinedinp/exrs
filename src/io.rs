@@ -493,7 +493,6 @@ macro_rules! implement_data_for_primitive {
     };
 }
 
-implement_data_for_primitive!(u8);
 implement_data_for_primitive!(i8);
 implement_data_for_primitive!(i16);
 implement_data_for_primitive!(u16);
@@ -503,6 +502,92 @@ implement_data_for_primitive!(i64);
 implement_data_for_primitive!(u64);
 implement_data_for_primitive!(f32);
 implement_data_for_primitive!(f64);
+
+impl Data for u8 {
+    #[inline]
+    fn read_le(read: &mut impl Read) -> Result<Self> {
+        Ok(read.read_from_little_endian()?)
+    }
+
+    #[inline]
+    fn read_ne(read: &mut impl Read) -> Result<Self> {
+        Ok(read.read_from_native_endian()?)
+    }
+
+    #[inline]
+    fn write_le(self, write: &mut impl Write) -> Result<()> {
+        write.write_as_little_endian(&self)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_ne(self, write: &mut impl Write) -> Result<()> {
+        write.write_as_native_endian(&self)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn read_slice_le(read: &mut impl Read, slice: &mut [Self]) -> Result<()> {
+        read.read_from_little_endian_into(slice)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn read_slice_ne(read: &mut impl Read, slice: &mut [Self]) -> Result<()> {
+        read.read_from_native_endian_into(slice)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_slice_le(write: &mut impl Write, slice: &[Self]) -> Result<()> {
+        write.write_as_little_endian(slice)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_slice_ne(write: &mut impl Write, slice: &[Self]) -> Result<()> {
+        write.write_as_native_endian(slice)?;
+        Ok(())
+    }
+
+    // Bytes have no endianness conversion, so growing the vec can read
+    // straight into spare capacity instead of the generic `read_into_vec_le`
+    // path's zero-fill-then-overwrite (`Vec::resize` followed by
+    // `read_slice_le`). This is the read path
+    // for every compressed chunk in the file (`compressed_pixels_le` etc.),
+    // so the double write is paid on every chunk read.
+    #[inline]
+    fn read_vec_le(
+        read: &mut impl Read,
+        data_size: usize,
+        soft_max: usize,
+        hard_max: Option<usize>,
+        purpose: &'static str,
+    ) -> Result<Vec<Self>> {
+        if let Some(max) = hard_max {
+            if data_size > max {
+                return Err(Error::invalid(purpose));
+            }
+        }
+
+        let soft_max = hard_max.unwrap_or(soft_max).min(soft_max);
+        let mut data = Vec::with_capacity(data_size.min(soft_max));
+
+        // Grow in `soft_max`-sized steps, same as the generic path, so a
+        // corrupt or adversarial size field cannot force one huge allocation
+        // before any of it is confirmed to actually exist in the stream.
+        while data.len() < data_size {
+            let want = (data.len() + soft_max).min(data_size) - data.len();
+            let got = read.by_ref().take(want as u64).read_to_end(&mut data)?;
+
+            if got != want {
+                return Err(Error::invalid("reference to missing bytes"));
+            }
+        }
+
+        Ok(data)
+    }
+}
 
 impl Data for f16 {
     #[inline]
