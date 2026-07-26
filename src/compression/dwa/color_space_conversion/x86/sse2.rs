@@ -57,6 +57,16 @@ pub fn csc709_inverse_8x8(v1: V1, block: &mut [[f32; 64]; 3]) {
 }
 
 pub fn csc709_inverse_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+    for block in blocks {
+        inverse_one(v1, block);
+    }
+}
+
+/// One 8x8 inverse CSC. Extracted from `csc709_inverse_8x8_batch` (mirrors
+/// `avx2::inverse_one`) so the SSE2 fused decode path can call it per spatial
+/// block while the three component buffers are still L1-hot.
+#[inline(always)]
+pub(crate) fn inverse_one(v1: V1, block: &mut [[f32; 64]; 3]) {
     let c_ry = v1.splat_f32x4(1.5747);
     let c_by_g = v1.splat_f32x4(0.1873);
     let c_ry_g = v1.splat_f32x4(0.4682);
@@ -66,21 +76,19 @@ pub fn csc709_inverse_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut
     let add = |a, b| v1.add_f32x4(a, b);
     let sub = |a, b| v1.sub_f32x4(a, b);
 
-    for block in blocks {
-        let [comp0, comp1, comp2] = block;
-        for chunk in 0..16 {
-            let base = chunk * 4;
-            let y = load(comp0, base);
-            let by = load(comp1, base);
-            let ry = load(comp2, base);
+    let [comp0, comp1, comp2] = block;
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        let y = load(comp0, base);
+        let by = load(comp1, base);
+        let ry = load(comp2, base);
 
-            let r = add(y, mul(ry, c_ry));
-            let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
-            let b = add(y, mul(by, c_by));
+        let r = add(y, mul(ry, c_ry));
+        let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
+        let b = add(y, mul(by, c_by));
 
-            store(comp0, base, r);
-            store(comp1, base, g);
-            store(comp2, base, b);
-        }
+        store(comp0, base, r);
+        store(comp1, base, g);
+        store(comp2, base, b);
     }
 }

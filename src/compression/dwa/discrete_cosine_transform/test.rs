@@ -116,6 +116,49 @@ mod avx2_tests {
     }
 }
 
+// AVX-512 tier correctness tests (Stage 1 prototype; not yet wired into
+// runtime dispatch). Opt-in via the `avx512-tests` feature; `V4::try_new`
+// requires avx512f/bw/cd/dq/vl all present.
+#[cfg(all(test, feature = "avx512-tests"))]
+mod avx512_tests {
+    use pulp::x86::V4;
+
+    use super::{
+        super::{dct_inverse_8x8_autovectorized, x86::avx512},
+        pseudo_random_blocks,
+    };
+    use crate::image::validate_results::ValidateResult;
+
+    /// Compares the AVX-512 2-blocks-per-register kernel against the scalar
+    /// reference applied to each block independently -> the AVX-512 kernel
+    /// must produce the same result as if the two blocks had been decoded
+    /// one at a time.
+    fn assert_pairs_match(kernel: impl Fn(&mut [f32; 64], &mut [f32; 64])) {
+        for pair in pseudo_random_blocks(4096).chunks_exact(2) {
+            let mut expected_a = pair[0];
+            let mut expected_b = pair[1];
+            let mut actual_a = pair[0];
+            let mut actual_b = pair[1];
+
+            dct_inverse_8x8_autovectorized(&mut expected_a);
+            dct_inverse_8x8_autovectorized(&mut expected_b);
+            kernel(&mut actual_a, &mut actual_b);
+
+            expected_a.to_vec().assert_approx_equals_result(&actual_a.to_vec());
+            expected_b.to_vec().assert_approx_equals_result(&actual_b.to_vec());
+        }
+    }
+
+    #[test]
+    fn avx512_inverse_matches_autovectorized() {
+        assert_pairs_match(|a, b| avx512::dct_inverse_8x8_pair(expect_avx512(), a, b));
+    }
+
+    fn expect_avx512() -> V4 {
+        V4::try_new().expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
+    }
+}
+
 // SSE2 tier correctness tests. Opt-in via the `sse2-tests` feature. These force
 // the SSE2 fallback path, so they must run with AVX2 hidden (e.g. under an SDE
 // CPU without AVX2); `expect_sse2_without_avx2` asserts that.

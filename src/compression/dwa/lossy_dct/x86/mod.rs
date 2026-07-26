@@ -7,6 +7,11 @@
 // the ~1 KiB working set stays L1-hot, instead of four passes over a wide
 // strip tile. Needs the `V3` tier and `F16c`; if either is missing, the
 // caller falls back to the strip-tiled path.
+//
+// An SSE2-only variant of this fusion (no F16C, so scalar zigzag/half
+// conversion) was prototyped and benchmarked: it was a small (~1-1.5%) but
+// consistent and reproducible *regression* against the existing strip-tiled
+// SSE2 path, not a win, because that path's `STRIP_BLOCK_COLS` x-tiling
 
 use std::convert::TryInto;
 

@@ -11,6 +11,11 @@ use pulp::x86::{V1, V3};
 #[doc(hidden)]
 pub mod avx2;
 
+// Stage-1 prototype (not yet wired into dispatch below) -- public only for
+// benchmarking/correctness testing.
+#[doc(hidden)]
+pub mod avx512;
+
 // public only for benchmarking
 #[doc(hidden)]
 pub mod sse2;

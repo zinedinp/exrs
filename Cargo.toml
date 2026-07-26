@@ -33,7 +33,7 @@ flate2 = { version = "^1.1.9", default-features = false, features = ["zlib-rs"] 
 smallvec = "^1.15.2"            # make cache-friendly allocations        TODO profile if smallvec is really an improvement!
 rayon-core = { version = "^1.13.0", optional = true }         # threading for parallel compression
 zune-inflate = { version = "^0.2.54", default-features = false, features = ["zlib"] }  # zip decompression, faster than miniz_oxide
-pulp = "0.22.3"                # used for runtime SIMD dispatch
+pulp = { version = "0.22.3", features = ["x86-v4"] }   # used for runtime SIMD dispatch; x86-v4 = AVX-512 tier
 num-complex = "0.4.6"          # pins pulps own dependency, pulp wants 0.4.4 but calls for Complex::ZERO/ONE/I; consts added in 0.4.6
 
 [dev-dependencies]
@@ -55,6 +55,7 @@ rayon = ["dep:rayon-core"]
 # `cargo test --lib --features avx2-tests -- avx2`
 avx2-tests = []
 sse2-tests = []
+avx512-tests = []
 
 # Call the DWA DCT avx2/sse2/autovectorized kernels directly,
 # bypassing runtime dispatch, for the comparison benchmark.
@@ -166,9 +167,10 @@ codegen-units = 16
 
 # TEMPORARY: routes `pulp` to a fork that adds safe wrappers for the F16C
 # half<->float conversion intrinsics (`_mm256_cvtph_ps` and friends), which
-# upstream pulp does not expose yet.
+# upstream pulp does not expose yet, plus the `v4_fn!` macro (avoids the
+# vectorize()-closure inlining trap for large AVX-512 kernels).
 [patch.crates-io]
-pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "gather_u16x8" }
+pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "V4-vectorize-in-target-feature" }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = { version = "11.6.0", default-features = false }
