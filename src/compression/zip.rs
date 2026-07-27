@@ -12,7 +12,7 @@ use crate::error::Result;
 
 pub fn decompress_bytes(
     channels: &ChannelList,
-    data_le: ByteVec,
+    data_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize,
     _pedantic: bool,
@@ -20,7 +20,7 @@ pub fn decompress_bytes(
     let options = zune_inflate::DeflateOptions::default()
         .set_limit(expected_byte_size)
         .set_size_hint(expected_byte_size);
-    let mut decoder = zune_inflate::DeflateDecoder::new_with_options(&data_le, options);
+    let mut decoder = zune_inflate::DeflateDecoder::new_with_options(data_le, options);
     let mut decompressed_le =
         decoder.decode_zlib().map_err(|_| Error::invalid("zlib-compressed data malformed"))?;
 

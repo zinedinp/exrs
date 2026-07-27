@@ -271,7 +271,7 @@ fn cpy_u8(src: &[u16], src_i: usize, dst: &mut [u8], dst_i: usize, n: usize) {
 
 pub fn decompress(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize,
     _pedantic: bool,
@@ -743,7 +743,7 @@ mod test {
         let compressed = b44::compress(&channels, pixel_bytes.clone(), rectangle, true).unwrap();
 
         let decompressed =
-            b44::decompress(&channels, compressed.clone(), rectangle, pixel_bytes.len(), true)
+            b44::decompress(&channels, &compressed, rectangle, pixel_bytes.len(), true)
                 .unwrap();
 
         assert_eq!(decompressed.len(), pixel_bytes.len());

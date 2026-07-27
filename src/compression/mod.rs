@@ -292,87 +292,95 @@ impl Compression {
 
         let expected_byte_size = pixel_section.size.area() * header.channels.bytes_per_pixel; // FIXME this needs to account for subsampling anywhere
 
-        // note: always true where self == Uncompressed
-        if compressed_le.len() == expected_byte_size {
-            // the compressed data was larger than the raw data, so the small raw data has
-            // been written
-            convert_little_endian_to_current(compressed_le, &header.channels, pixel_section)
-        } else {
-            use self::Compression::*;
-            let bytes_ne = match self {
-                Uncompressed => {
-                    convert_little_endian_to_current(compressed_le, &header.channels, pixel_section)
-                }
-                ZIP16 => zip::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                ZIP1 => zip::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                RLE => rle::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                PIZ => piz::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                PXR24 => pxr24::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                B44 | B44A => b44::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                DWAA(_) | DWAB(_) => dwa::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                _ => {
-                    return Err(Error::unsupported(format!(
-                        "yet unimplemented compression method: {self}"
-                    )));
-                }
-            };
+        use self::Compression::*;
 
-            // map all errors to compression errors
-            let bytes_ne = bytes_ne.map_err(|decompression_error| match decompression_error {
-                Error::NotSupported(message) => Error::unsupported(format!(
-                    "yet unimplemented compression special case ({message})"
-                )),
+        // Stored raw (always true for `Uncompressed`, and for any codec that
+        // fell back to writing the smaller raw payload): the buffer becomes the
+        // output, so it cannot be recycled.
+        if self == Uncompressed || compressed_le.len() == expected_byte_size {
+            return convert_little_endian_to_current(
+                compressed_le,
+                &header.channels,
+                pixel_section,
+            );
+        }
 
-                error => Error::invalid(format!("compressed {self:?} data ({error})")),
-            })?;
-
-            if bytes_ne.len() == expected_byte_size {
-                Ok(bytes_ne)
-            } else {
-                Err(Error::invalid("decompressed data"))
+        // Codecs only borrow the compressed bytes as a slice; recycle the
+        // buffer after so the next chunk of the same size can reuse its pages.
+        let bytes_ne = match self {
+            Uncompressed => unreachable!("handled above"),
+            ZIP16 => zip::decompress_bytes(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            ZIP1 => zip::decompress_bytes(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            RLE => rle::decompress_bytes(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            PIZ => piz::decompress(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            PXR24 => pxr24::decompress(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            B44 | B44A => b44::decompress(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            DWAA(_) | DWAB(_) => dwa::decompress(
+                &header.channels,
+                &compressed_le,
+                pixel_section,
+                expected_byte_size,
+                pedantic,
+            ),
+            _ => {
+                crate::block::pool::recycle(compressed_le);
+                return Err(Error::unsupported(format!(
+                    "yet unimplemented compression method: {self}"
+                )));
             }
+        };
+
+        crate::block::pool::recycle(compressed_le);
+
+        // map all errors to compression errors
+        let bytes_ne = bytes_ne.map_err(|decompression_error| match decompression_error {
+            Error::NotSupported(message) => Error::unsupported(format!(
+                "yet unimplemented compression special case ({message})"
+            )),
+
+            error => Error::invalid(format!("compressed {self:?} data ({error})")),
+        })?;
+
+        if bytes_ne.len() == expected_byte_size {
+            Ok(bytes_ne)
+        } else {
+            Err(Error::invalid("decompressed data"))
         }
     }
 

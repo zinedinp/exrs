@@ -29,7 +29,7 @@ struct ChannelData {
 
 pub fn decompress(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize, /* TODO remove expected byte size as it can be computed with
                                 * `rectangle.size.area() * channels.bytes_per_pixel` */
@@ -47,7 +47,7 @@ pub fn decompress(
 
     let mut bitmap = vec![0_u8; BITMAP_SIZE]; // FIXME use bit_vec!
 
-    let mut remaining_input_le = compressed_le.as_slice();
+    let mut remaining_input_le = compressed_le;
     let min_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
     let max_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
 
@@ -327,7 +327,7 @@ mod test {
 
         let compressed = piz::compress(&channels, pixel_bytes.clone(), rectangle).unwrap();
         let decompressed =
-            piz::decompress(&channels, compressed, rectangle, pixel_bytes.len(), true).unwrap();
+            piz::decompress(&channels, &compressed, rectangle, pixel_bytes.len(), true).unwrap();
 
         assert_eq!(pixel_bytes, decompressed);
     }

@@ -158,7 +158,7 @@ pub fn compress(channels: &ChannelList, bytes_ne: ByteVec, area: IntegerBounds) 
 
 pub fn decompress(
     channels: &ChannelList,
-    bytes_le: ByteVec,
+    bytes_le: &[u8],
     area: IntegerBounds,
     expected_byte_size: usize,
     pedantic: bool,
@@ -166,7 +166,7 @@ pub fn decompress(
     let options = zune_inflate::DeflateOptions::default()
         .set_limit(expected_byte_size)
         .set_size_hint(expected_byte_size);
-    let mut decompressor = zune_inflate::DeflateDecoder::new_with_options(&bytes_le, options);
+    let mut decompressor = zune_inflate::DeflateDecoder::new_with_options(bytes_le, options);
 
     let encoded_be =
         decompressor.decode_zlib().map_err(|_| Error::invalid("zlib-compressed data malformed"))?; // TODO share code with zip?

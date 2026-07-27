@@ -1,5 +1,6 @@
-//! Reuse of the byte buffers that decompressed blocks are handed out in, and of
-//! the compressed-chunk output buffers produced while writing.
+//! Reuse of the byte buffers that decompressed blocks are handed out in, of the
+//! compressed-chunk buffers produced while writing, and of the compressed-chunk
+//! buffers filled while reading.
 //!
 //! Every decompressed chunk gets a fresh output buffer, which is dropped again
 //! as soon as the reader has copied the samples out of it. On a 4k DWA image
@@ -23,6 +24,12 @@
 //! dropped. `take_with_capacity`/`recycle` let compressors pull a
 //! previously-used buffer's pages back instead of faulting in new ones for
 //! every chunk.
+//!
+//! The read side mirrors that for compressed input: `Chunk::read` fills a
+//! pooled buffer via `take_with_capacity`, decompressors only borrow it as
+//! `&[u8]`, and `decompress_image_section_from_le` recycles it once the codec
+//! is done (unless the buffer is reused as the uncompressed output, which
+//! happens when the file stored the section raw).
 //!
 //! Buffers are only ever retained once something has actually asked for
 //! one, so an image whose compression method does not use the pool never makes
@@ -56,14 +63,7 @@ fn lock_pool() -> MutexGuard<'static, Vec<Vec<u8>>> {
 pub fn take_zeroed(size: usize) -> Vec<u8> {
     POOL_IS_USED.store(true, Ordering::Relaxed);
 
-    let recycled = {
-        let mut pool = lock_pool();
-        pool.iter()
-            .position(|buffer| buffer.capacity() >= size)
-            .map(|index| pool.swap_remove(index))
-    };
-
-    match recycled {
+    match take_best_fit(size) {
         // capacity is known to be sufficient, so this zeroes without reallocating
         Some(mut buffer) => {
             buffer.clear();
@@ -82,15 +82,22 @@ pub fn take_zeroed(size: usize) -> Vec<u8> {
 pub fn take_with_capacity(min_capacity: usize) -> Vec<u8> {
     POOL_IS_USED.store(true, Ordering::Relaxed);
 
-    let recycled = {
-        let mut pool = lock_pool();
-        pool.iter()
-            .position(|buffer| buffer.capacity() >= min_capacity)
-            .map(|index| pool.swap_remove(index))
-    };
-
     // buffers are always stored cleared (`recycle`), so no `clear()` needed here
-    recycled.unwrap_or_else(|| Vec::with_capacity(min_capacity))
+    take_best_fit(min_capacity).unwrap_or_else(|| Vec::with_capacity(min_capacity))
+}
+
+/// Smallest pooled buffer whose capacity is at least `min_capacity`, so a small
+/// compressed-chunk take cannot steal a multi-MiB decompressed output buffer
+/// (first-fit would do that once both sizes share the pool).
+fn take_best_fit(min_capacity: usize) -> Option<Vec<u8>> {
+    let mut pool = lock_pool();
+    let index = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, buffer)| buffer.capacity() >= min_capacity)
+        .min_by_key(|(_, buffer)| buffer.capacity())
+        .map(|(index, _)| index)?;
+    Some(pool.swap_remove(index))
 }
 
 /// Offer a block's buffer to the next decompression or compression that
@@ -158,6 +165,33 @@ mod test {
         release();
         recycle(vec![0; MAX_POOLED_BYTES + 1]);
         assert_eq!(lock_pool().len(), 0, "buffer over the byte limit must not be retained");
+
+        release();
+    }
+
+    /// Once both a large decompressed buffer and a small compressed buffer sit
+    /// in the pool, a small `take_with_capacity` must not steal the large one
+    /// (best-fit), or every later `take_zeroed(large)` would allocate fresh.
+    #[test]
+    fn take_prefers_smallest_sufficient_buffer() {
+        release();
+        POOL_IS_USED.store(true, Ordering::Relaxed);
+
+        let large = vec![0u8; 64 * 1024];
+        let small = vec![0u8; 1024];
+        let large_addr = large.as_ptr() as usize;
+        let small_addr = small.as_ptr() as usize;
+        recycle(large);
+        recycle(small);
+
+        let taken_small = take_with_capacity(512);
+        assert_eq!(taken_small.as_ptr() as usize, small_addr, "small take stole the large buffer");
+        assert!(taken_small.capacity() < 64 * 1024);
+
+        let taken_large = take_zeroed(32 * 1024);
+        assert_eq!(taken_large.as_ptr() as usize, large_addr, "large take missed the large buffer");
+        assert_eq!(taken_large.len(), 32 * 1024);
+        assert!(taken_large.iter().all(|&byte| byte == 0));
 
         release();
     }

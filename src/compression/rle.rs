@@ -7,12 +7,12 @@ const MAX_RUN_LENGTH: usize = 127;
 
 pub fn decompress_bytes(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize,
     pedantic: bool,
 ) -> Result<ByteVec> {
-    let mut decompressed_le = unpack_rle_tokens(&compressed_le, expected_byte_size, pedantic)?;
+    let mut decompressed_le = unpack_rle_tokens(compressed_le, expected_byte_size, pedantic)?;
     differences_to_samples(&mut decompressed_le);
     interleave_byte_blocks(&mut decompressed_le);
     super::convert_little_endian_to_current(decompressed_le, channels, rectangle)

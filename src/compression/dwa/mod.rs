@@ -250,7 +250,7 @@ pub fn compress(
 
 pub fn decompress(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize,
     _pedantic: bool,
@@ -262,7 +262,7 @@ pub fn decompress(
     // the writer stores chunks raw when compression would not have helped
     if compressed_le.len() == expected_byte_size {
         return crate::compression::convert_little_endian_to_current(
-            compressed_le,
+            compressed_le.to_vec(),
             channels,
             rectangle,
         );
@@ -271,7 +271,7 @@ pub fn decompress(
     #[cfg(feature = "dwa-profile")]
     let total = profile::start();
 
-    let mut input = compressed_le.as_slice();
+    let mut input = compressed_le;
     let header = DwaHeader::parse(&mut input)?;
 
     let rules = if header.version < 2 {
