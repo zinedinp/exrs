@@ -89,6 +89,10 @@ required-features = ["rayon"]
 name = "9_read_pixels_reusing_buffer"
 required-features = ["rayon"]
 
+[[example]]
+name = "tiled_bench"
+required-features = ["rayon"]
+
 [[bench]]
 name = "read"
 harness = false

@@ -114,12 +114,13 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
     /// speedup on multi-core machines, at the cost of a different
     /// `set_row_pixel` closure signature: it receives one row of the pixel
     /// storage as a slice plus an `x` index, rather than the whole storage
-    /// plus a `Vec2` position, since concurrent workers only ever get access
-    /// to their own disjoint row range. Requires `PixelStorage` to implement
+    /// plus a `Vec2` position. Requires `PixelStorage` to implement
     /// [`RowMajorPixelStorage`] (implemented by [`FlatRowMajorPixelStorage`]).
     /// A single contiguous buffer is required (rather than one `Vec` per row)
-    /// so that worker threads split disjoint row ranges directly out of it,
-    /// instead of writing into scattered, independently heap-allocated rows.
+    /// so that scanline workers can split disjoint full-width row bands out
+    /// of it. Tiled files also decompress in parallel; their pixel writes
+    /// share the flat buffer under a brief lock (tile rectangles may share
+    /// rows), still with correct per-tile `x` and width.
     #[cfg(feature = "rayon")]
     fn collect_pixels_in_parallel<Pixel, PixelStorage, CreatePixels, SetRowPixel>(
         self, create_pixels: CreatePixels, set_row_pixel: SetRowPixel
@@ -153,9 +154,9 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
 ///   (requires the `rayon` feature), which splits disjoint row ranges out to
 ///   decompression worker threads.
 ///
-/// Contiguity matters for the parallel path: a worker's row range is obtained
-/// by splitting one buffer, rather than by indexing into a collection of
-/// separately heap-allocated rows
+/// Contiguity matters for the parallel path: scanline workers obtain a row
+/// range by splitting one buffer, and tiled workers write through a shared
+/// flat view, rather than indexing into separately heap-allocated rows.
 pub trait RowMajorPixelStorage {
     /// The element type stored per pixel slot, as passed to `set_row_pixel`.
     /// Not necessarily the same type `set_row_pixel` receives as its `Pixel`
@@ -600,23 +601,10 @@ where
         true
     }
 
-    // Reads and decompresses every remaining chunk using `pool`, writing
-    // each block's converted pixels directly from the worker that
-    // decompressed it -- instead of decompressing in parallel but converting
-    // serially on the driving thread, as the plain `read_block` loop does.
-    //
-    // Each chunk is dispatched to a worker as soon as it's read (its row
-    // range is cheap to look up -- header math on data `chunks.next()`
-    // already read, no decompression needed), so reading later chunks
-    // overlaps with decompressing earlier ones, same as `decompress_parallel`.
-    // This requires chunks to arrive in increasing-row order to hand out
-    // disjoint `split_at_mut` slices with a single forward-moving cursor --
-    // true for `LineOrder::Increasing` and, by convention, `Unspecified`
-    // (see `LineOrder`'s docs). `LineOrder::Decreasing` files fall back to a
-    // serial decode here (rare in practice; still correct, just not
-    // parallel), rather than buffering every chunk's compressed bytes
-    // in memory up front to sort by row, which would give up the
-    // read/decompress overlap for every file to support an uncommon case.
+    // Decompress+convert on workers as chunks arrive (read overlaps decompress).
+    // Scanline: exclusive row bands via split_at_mut. Tiled: one mutex per row
+    // (tiles share y; no unsafe strip split) with block-index x/width. Decreasing
+    // line order: serial fallback (rare; avoid buffering all chunks to re-sort).
     fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
         &mut self,
         header: &Header,
@@ -625,18 +613,9 @@ where
         pool: &rayon_core::ThreadPool,
         pedantic: bool,
     ) -> UnitResult {
-        let width = header.layer_size.width();
         let bytes_per_pixel = header.channels.bytes_per_pixel;
 
-        // The fast path below tracks a single forward-moving row cursor,
-        // assuming every incoming chunk is a scanline band strictly below the
-        // previous one. True for `LineOrder::Increasing`/`Unspecified`
-        // scanline files, but not for tiled files, where several chunks
-        // legitimately share the same `y` (one per tile column in a tile
-        // row) and are narrower than `width`. Both cases fall back to
-        // `read_block`.
-        let is_tiled = !matches!(header.blocks, crate::meta::BlockDescription::ScanLines);
-        if header.line_order == crate::meta::attribute::LineOrder::Decreasing || is_tiled {
+        if header.line_order == crate::meta::attribute::LineOrder::Decreasing {
             while let Some(chunk) = chunks.next() {
                 let block = UncompressedBlock::decompress_chunk(chunk?, meta_data, pedantic)?;
                 self.read_block(header, block)?;
@@ -644,6 +623,12 @@ where
             return Ok(());
         }
 
+        let is_tiled = !matches!(header.blocks, crate::meta::BlockDescription::ScanLines);
+        if is_tiled {
+            return self.read_tiled_blocks_in_parallel(header, chunks, meta_data, pool, pedantic);
+        }
+
+        let width = header.layer_size.width();
         let pixel_reader = &self.pixel_reader;
         let set_row_pixel = &self.set_row_pixel;
         let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
@@ -688,6 +673,10 @@ where
                         .and_then(|block| {
                             let mut pixels = vec![PxReader::RecursivePixel::default(); width];
 
+                            // Scanline bands are always full image width starting at x=0.
+                            // (Tried the same L1-resident run tiling as the serial path
+                            // here; at 8 threads workers are bandwidth-bound so the extra
+                            // loop is pure overhead)
                             for (y_offset, line_bytes) in
                                 block.data.chunks_exact(bytes_per_pixel * width).enumerate()
                             {
@@ -703,6 +692,143 @@ where
                             // recycled from the same worker that decompressed
                             // into it, so the next chunk on this thread can
                             // reuse the pages it just faulted in
+                            crate::block::pool::recycle(block.data);
+                            Ok(())
+                        });
+
+                    if let Err(new_error) = result {
+                        *error.lock().unwrap() = Some(new_error);
+                    }
+                });
+            }
+        });
+
+        match error.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "rayon")]
+impl<PixelStorage, SetRowPixel, PxReader, Pixel>
+    SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PxReader, Pixel>
+where
+    PxReader: RecursivePixelReader + Sync,
+    PxReader::RecursivePixel: IntoTuple<Pixel>,
+    PxReader::RecursiveChannelDescriptions: IntoNonRecursive,
+    PixelStorage: RowMajorPixelStorage,
+    PixelStorage::Element: Send,
+    SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
+    Pixel: Send,
+{
+    /// Parallel path for tiled files: decompress + convert on workers, write
+    /// under a per-row mutex. See `read_blocks_in_parallel`.
+    fn read_tiled_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        header: &Header,
+        mut chunks: R,
+        meta_data: &crate::meta::MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        let bytes_per_pixel = header.channels.bytes_per_pixel;
+        let pixel_reader = &self.pixel_reader;
+        let set_row_pixel = &self.set_row_pixel;
+        let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+
+        let storage_width = self.pixel_storage.width();
+        let flat = self.pixel_storage.pixels_mut();
+        let total_rows = if storage_width == 0 { 0 } else { flat.len() / storage_width };
+        // One mutex per row, not one mutex for the whole image. Tiles only
+        // ever contend when two of them share a row (same tile-row band,
+        // different tile-columns); `chunks_exact_mut` (safe)` to allow splitting a row-major buffer into
+        // concurrent vertical tile strips) hands out non-overlapping row
+        // slices up front, so unrelated tile-rows never touch the same lock.
+        let rows: Vec<std::sync::Mutex<&mut [PixelStorage::Element]>> = if storage_width == 0 {
+            Vec::new()
+        } else {
+            flat.chunks_exact_mut(storage_width).map(std::sync::Mutex::new).collect()
+        };
+
+        pool.scope(|scope| {
+            while let Some(chunk) = chunks.next() {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(new_error) => {
+                        *error.lock().unwrap() = Some(new_error);
+                        break;
+                    }
+                };
+
+                let (x0, y0, block_width, block_height) = match header
+                    .get_block_data_indices(&chunk.compressed_block)
+                    .and_then(|tile| header.get_absolute_block_pixel_coordinates(tile))
+                {
+                    Ok(indices) => {
+                        if indices.position.x() < 0 || indices.position.y() < 0 {
+                            *error.lock().unwrap() = Some(Error::invalid("chunk pixel position"));
+                            break;
+                        }
+                        (
+                            indices.position.x() as usize,
+                            indices.position.y() as usize,
+                            indices.size.width(),
+                            indices.size.height(),
+                        )
+                    }
+                    Err(new_error) => {
+                        *error.lock().unwrap() = Some(new_error);
+                        break;
+                    }
+                };
+
+                if y0 > total_rows
+                    || block_height > total_rows - y0
+                    || x0 > storage_width
+                    || block_width > storage_width - x0
+                {
+                    *error.lock().unwrap() = Some(Error::invalid("chunk tile range"));
+                    break;
+                }
+
+                let error = &error;
+                let rows = &rows;
+                scope.spawn(move |_| {
+                    let result = UncompressedBlock::decompress_chunk(chunk, meta_data, pedantic)
+                        .and_then(|block| {
+                            debug_assert_eq!(block.index.pixel_size.width(), block_width);
+                            debug_assert_eq!(block.index.pixel_size.height(), block_height);
+                            debug_assert_eq!(block.index.pixel_position.x(), x0);
+                            debug_assert_eq!(block.index.pixel_position.y(), y0);
+
+                            let mut pixels =
+                                vec![PxReader::RecursivePixel::default(); block_width];
+
+                            for (y_offset, line_bytes) in block
+                                .data
+                                .chunks_exact(bytes_per_pixel * block_width)
+                                .enumerate()
+                            {
+                                // Sample conversion stays outside the lock;
+                                // only this row's write is serialized, and
+                                // only against other tiles that share this
+                                // exact row.
+                                pixel_reader.read_pixels(
+                                    line_bytes,
+                                    block_width,
+                                    0,
+                                    &mut pixels,
+                                    |px| px,
+                                );
+
+                                let y = y0 + y_offset;
+                                let mut row = rows[y].lock().unwrap();
+                                for (x_offset, pixel) in pixels.iter().enumerate() {
+                                    set_row_pixel(&mut row, x0 + x_offset, pixel.into_tuple());
+                                }
+                            }
+
                             crate::block::pool::recycle(block.data);
                             Ok(())
                         });
