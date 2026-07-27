@@ -118,8 +118,60 @@ fn dct_inverse_bench_avx512_batch(bench: &mut Bencher) {
     })
 }
 
+/// A/B against `dct_inverse_bench_avx512_batch`: same 1-pair-per-iteration
+/// loop, but relies solely on LLVM's own loop unrolling for any ILP across
+/// iterations -> see `avx512::inverse_quad`'s doc comment for what "quad"
+/// changes.
+fn dct_inverse_bench_avx512_batch_quad(bench: &mut Bencher) {
+    let mut blocks = bench_blocks();
+    let v4 = expect_avx512();
+
+    bench.iter(|| {
+        avx512::dct_inverse_8x8_batch_quad(v4, blocks.iter_mut());
+
+        bencher::black_box(&mut blocks);
+    })
+}
+
+/// RGB-shaped baseline: 3 sequential `inverse_pair`s per spatial pair
+/// (mirrors `decode_pair_dct_csc`'s DCT loop). A/B partner is
+/// `dct_inverse_bench_avx512_rgb_comp_quad`.
+fn dct_inverse_bench_avx512_rgb_comp_seq(bench: &mut Bencher) {
+    let mut pairs = bench_rgb_pairs();
+    let v4 = expect_avx512();
+
+    bench.iter(|| {
+        avx512::dct_inverse_rgb_pair_components_seq(v4, &mut pairs);
+        bencher::black_box(&mut pairs);
+    })
+}
+
+/// RGB-shaped dual-port candidate: `inverse_quad(R,G)` + `inverse_pair(B)`.
+/// Same buffers / arithmetic as `_rgb_comp_seq`; only issue order changes.
+/// No extra spatial working set vs the fused pair path.
+fn dct_inverse_bench_avx512_rgb_comp_quad(bench: &mut Bencher) {
+    let mut pairs = bench_rgb_pairs();
+    let v4 = expect_avx512();
+
+    bench.iter(|| {
+        avx512::dct_inverse_rgb_pair_components_quad(v4, &mut pairs);
+        bencher::black_box(&mut pairs);
+    })
+}
+
 fn bench_blocks() -> Vec<[f32; 64]> {
     test::pseudo_random_blocks(4096)
+}
+
+/// 1024 RGB spatial pairs = 6144 blocks of work, same order of magnitude as
+/// the flat 4096-block inverse benches (those process 4096 single blocks;
+/// each RGB pair does 6).
+fn bench_rgb_pairs() -> Vec<avx512::RgbPairBlocks> {
+    let blocks = test::pseudo_random_blocks(1024 * 6);
+    blocks
+        .chunks_exact(6)
+        .map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]]))
+        .collect()
 }
 
 fn expect_avx2() -> V3 {
@@ -144,7 +196,10 @@ benchmark_group!(
     dct_inverse_bench_sse2,
     dct_inverse_bench_avx2,
     dct_inverse_bench_avx2_batch,
-    dct_inverse_bench_avx512_batch
+    dct_inverse_bench_avx512_batch,
+    dct_inverse_bench_avx512_batch_quad,
+    dct_inverse_bench_avx512_rgb_comp_seq,
+    dct_inverse_bench_avx512_rgb_comp_quad
 );
 
 benchmark_main!(dct);

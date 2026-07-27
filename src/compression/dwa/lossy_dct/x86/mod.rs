@@ -220,11 +220,20 @@ pub(super) fn try_decode_group_fused(
     Some(Ok(()))
 }
 
-// `v4_fn!` instead of `V4::vectorize`: this body calls `dct_avx512::inverse_pair`,
-// which bottoms out in `recombine` -- the function whose codegen silently
-// degraded ~50x under the closure trampoline (LLVM's optional inlining pass
-// declined to merge it). `v4_fn!` pastes the body directly inside a
-// `#[target_feature]` function instead, guaranteeing real AVX-512 codegen.
+// `v4_fn!` instead of `V4::vectorize`: this body calls `dct_avx512::inverse_pair`
+// / `inverse_quad`, which bottom out in `recombine` -- the function whose
+// codegen silently degraded ~50x under the closure trampoline (LLVM's optional
+// inlining pass declined to merge it). `v4_fn!` pastes the body directly inside
+// a `#[target_feature]` function instead, guaranteeing real AVX-512 codegen.
+//
+// Dual-port logic stays *inside* this body (no external helpers): callees of a
+// `#[target_feature]` fn do not inherit the feature set unless fully inlined.
+//
+// RGB component dual-port is **opt-in** (`dwa-avx512-rgb-comp-quad`): when R and
+// G both need pair-iDCT, `inverse_quad(R∥G)` then needs-match B. Microbench is
+// a real win; whole-pipeline A/B regressed `lossy_dct` slightly — default stays
+// the sequential 3× `inverse_pair` loop. Profile counters (under `dwa-profile`)
+// record pair-step / quad-hit rate when the feature is on.
 pulp::v4_fn! {
     fn decode_pair_dct_csc(
         v4: V4,
@@ -237,29 +246,171 @@ pulp::v4_fn! {
     ) {
         let coef2 = dct_avx2::Coefficients::new(v3);
         let coef4 = dct_avx512::Coefficients::new(v4);
-        for component in 0..components {
-            match (needs_a[component], needs_b[component]) {
+
+        #[cfg(feature = "dwa-profile")]
+        if components == 3 {
+            crate::compression::dwa::profile::DCT_RGB_PAIR_STEPS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        #[cfg(feature = "dwa-avx512-rgb-comp-quad")]
+        let use_rgb_comp_quad = components == 3
+            && needs_a[0]
+            && needs_b[0]
+            && needs_a[1]
+            && needs_b[1];
+        #[cfg(not(feature = "dwa-avx512-rgb-comp-quad"))]
+        let use_rgb_comp_quad = false;
+
+        if use_rgb_comp_quad {
+            #[cfg(feature = "dwa-profile")]
+            crate::compression::dwa::profile::DCT_RGB_COMP_QUAD
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let (a_r, a_rest) = dct_a.split_at_mut(1);
+            let (a_g, a_b) = a_rest.split_at_mut(1);
+            let (b_r, b_rest) = dct_b.split_at_mut(1);
+            let (b_g, b_b) = b_rest.split_at_mut(1);
+            dct_avx512::inverse_quad(
+                v4,
+                &coef4,
+                &mut a_r[0],
+                &mut b_r[0],
+                &mut a_g[0],
+                &mut b_g[0],
+            );
+            match (needs_a[2], needs_b[2]) {
                 (true, true) => {
-                    dct_avx512::inverse_pair(
-                        v4,
-                        &coef4,
-                        &mut dct_a[component],
-                        &mut dct_b[component],
-                    );
+                    dct_avx512::inverse_pair(v4, &coef4, &mut a_b[0], &mut b_b[0]);
                 }
                 (true, false) => {
-                    dct_avx2::inverse_one(v3, &coef2, &mut dct_a[component]);
+                    dct_avx2::inverse_one(v3, &coef2, &mut a_b[0]);
                 }
                 (false, true) => {
-                    dct_avx2::inverse_one(v3, &coef2, &mut dct_b[component]);
+                    dct_avx2::inverse_one(v3, &coef2, &mut b_b[0]);
                 }
                 (false, false) => {}
+            }
+        } else {
+            for component in 0..components {
+                match (needs_a[component], needs_b[component]) {
+                    (true, true) => {
+                        dct_avx512::inverse_pair(
+                            v4,
+                            &coef4,
+                            &mut dct_a[component],
+                            &mut dct_b[component],
+                        );
+                    }
+                    (true, false) => {
+                        dct_avx2::inverse_one(v3, &coef2, &mut dct_a[component]);
+                    }
+                    (false, true) => {
+                        dct_avx2::inverse_one(v3, &coef2, &mut dct_b[component]);
+                    }
+                    (false, false) => {}
+                }
             }
         }
 
         if components == 3 {
             color_space_conversion::x86::avx512::inverse_pair(v4, dct_a, dct_b);
         }
+    }
+}
+
+/// One step of the AVX-512 fused loop: a pair (2 blocks) via the 2-block DCT+
+/// CSC kernel, or -- if only one block remains -- a single block via the
+/// AVX2 single-block kernel. Shared by `try_decode_group_fused_avx512` (every
+/// step) so the pair path and its odd-block tail cannot diverge.
+/// Returns the next `block_index` (advanced by 1 or 2) and any error.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn step_pair_or_single_avx512(
+    v4: V4,
+    v3: V3,
+    f16c: F16c,
+    ac: &mut PackedStream<'_>,
+    dc: &mut PackedStream<'_>,
+    block_index: usize,
+    block_count: usize,
+    blocks_x: usize,
+    width: usize,
+    height: usize,
+    components: usize,
+    to_linear: Option<&[u16; 65536]>,
+    targets: &mut [ScanlineTarget<'_>],
+    out: &mut [u8],
+) -> (usize, Option<Error>) {
+    let mut dct_a = [[0.0f32; 64]; 3];
+    let mut dct_b = [[0.0f32; 64]; 3];
+    let mut needs_a = [false; 3];
+    let mut needs_b = [false; 3];
+
+    let block_x0 = block_index % blocks_x;
+    let block_y0 = block_index / blocks_x;
+    let x_count0 = 8.min(width - block_x0 * 8);
+    let y_count0 = 8.min(height - block_y0 * 8);
+
+    if let Err(e) =
+        zigzag_block(v3, f16c, ac, dc, components, block_count, block_index, &mut dct_a, &mut needs_a)
+    {
+        return (block_index, Some(e));
+    }
+
+    let next_index = block_index + 1;
+    if next_index < block_count {
+        let block_x1 = next_index % blocks_x;
+        let block_y1 = next_index / blocks_x;
+        let x_count1 = 8.min(width - block_x1 * 8);
+        let y_count1 = 8.min(height - block_y1 * 8);
+
+        if let Err(e) = zigzag_block(
+            v3,
+            f16c,
+            ac,
+            dc,
+            components,
+            block_count,
+            next_index,
+            &mut dct_b,
+            &mut needs_b,
+        ) {
+            return (next_index, Some(e));
+        }
+
+        decode_pair_dct_csc(v4, v3, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
+
+        let mut write_err =
+            write_block(v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out);
+        if write_err.is_none() {
+            write_err = write_block(
+                v3, f16c, block_x1, block_y1, x_count1, y_count1, to_linear, &dct_b, targets, out,
+            );
+        }
+
+        (block_index + 2, write_err)
+    } else {
+        // Odd trailing block: not worth a 2-block kernel for one block.
+        let mut write_err: Option<Error> = None;
+        v3.vectorize(|| {
+            let coef = dct_avx2::Coefficients::new(v3);
+            for component in 0..components {
+                if needs_a[component] {
+                    dct_avx2::inverse_one(v3, &coef, &mut dct_a[component]);
+                }
+            }
+
+            if components == 3 {
+                color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_a);
+            }
+
+            write_err = write_block(
+                v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out,
+            );
+        });
+
+        (block_index + 1, write_err)
     }
 }
 
@@ -300,98 +451,28 @@ pub(super) fn try_decode_group_fused_avx512(
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
 
-    let mut dct_a = [[0.0f32; 64]; 3];
-    let mut dct_b = [[0.0f32; 64]; 3];
-    let mut needs_a = [false; 3];
-    let mut needs_b = [false; 3];
-
     let mut block_index = 0usize;
     while block_index < block_count {
-        let block_x0 = block_index % blocks_x;
-        let block_y0 = block_index / blocks_x;
-        let x_count0 = 8.min(width - block_x0 * 8);
-        let y_count0 = 8.min(height - block_y0 * 8);
-
-        if let Err(e) = zigzag_block(
-            v3,
-            f16c,
-            ac,
-            dc,
-            components,
-            block_count,
-            block_index,
-            &mut dct_a,
-            &mut needs_a,
-        ) {
+        let (next, err) = step_pair_or_single_avx512(
+            v4, v3, f16c, ac, dc, block_index, block_count, blocks_x, width, height, components,
+            to_linear, targets, out,
+        );
+        if let Some(e) = err {
             return Some(Err(e));
         }
-
-        let next_index = block_index + 1;
-        if next_index < block_count {
-            let block_x1 = next_index % blocks_x;
-            let block_y1 = next_index / blocks_x;
-            let x_count1 = 8.min(width - block_x1 * 8);
-            let y_count1 = 8.min(height - block_y1 * 8);
-
-            if let Err(e) = zigzag_block(
-                v3,
-                f16c,
-                ac,
-                dc,
-                components,
-                block_count,
-                next_index,
-                &mut dct_b,
-                &mut needs_b,
-            ) {
-                return Some(Err(e));
-            }
-
-            decode_pair_dct_csc(v4, v3, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
-
-            let mut write_err =
-                write_block(v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out);
-            if write_err.is_none() {
-                write_err = write_block(
-                    v3, f16c, block_x1, block_y1, x_count1, y_count1, to_linear, &dct_b, targets, out,
-                );
-            }
-            if let Some(err) = write_err {
-                return Some(Err(err));
-            }
-
-            block_index += 2;
-        } else {
-            // Odd trailing block: not worth a 2-block kernel for one block.
-            let mut write_err: Option<Error> = None;
-            v3.vectorize(|| {
-                let coef = dct_avx2::Coefficients::new(v3);
-                for component in 0..components {
-                    if needs_a[component] {
-                        dct_avx2::inverse_one(v3, &coef, &mut dct_a[component]);
-                    }
-                }
-
-                if components == 3 {
-                    color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_a);
-                }
-
-                write_err = write_block(
-                    v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets,
-                    out,
-                );
-            });
-            if let Some(err) = write_err {
-                return Some(Err(err));
-            }
-
-            block_index += 1;
-        }
+        block_index = next;
     }
 
     dc.advance(components * block_count);
     Some(Ok(()))
 }
+
+// Spatial 4-block `inverse_quad` fused decode (zigzag×4 then DCT×4) was A/B'd
+// 2026-07-27 and reverted: isolated DCT +6.4% did not survive whole-pipeline
+// (noise only) because the doubled zigzag-before-DCT working set ate the win.
+// Component-level R∥G dual-port is a different idea (same spatial pair, no extra
+// zigzag): micro +6–11%, pipeline flat-to-worse across sessions → opt-in only
+// via `dwa-avx512-rgb-comp-quad`. Production default is sequential 3× inverse_pair.
 
 #[inline(always)]
 fn linearize_scalar(value: f32, to_linear: Option<&[u16; 65536]>) -> f16 {

@@ -21,6 +21,10 @@ pub static RLE_INFLATE_NS: AtomicU64 = AtomicU64::new(0);
 pub static RLE_ALLOC_NS: AtomicU64 = AtomicU64::new(0);
 pub static RLE_UNPACK_NS: AtomicU64 = AtomicU64::new(0);
 pub static DCT_NS: AtomicU64 = AtomicU64::new(0);
+/// AVX-512 fused RGB pair steps that entered `decode_pair_dct_csc` (components==3).
+pub static DCT_RGB_PAIR_STEPS: AtomicU64 = AtomicU64::new(0);
+/// Of those, how many used component-level `inverse_quad` (any two (true,true) comps).
+pub static DCT_RGB_COMP_QUAD: AtomicU64 = AtomicU64::new(0);
 pub static ASSEMBLE_NS: AtomicU64 = AtomicU64::new(0);
 // Whole-`decompress` time and the output buffer allocation inside it, to see
 // how much of the wall time falls outside the stages above (chunk parsing,
@@ -52,6 +56,8 @@ pub fn reset() {
         &RLE_ALLOC_NS,
         &RLE_UNPACK_NS,
         &DCT_NS,
+        &DCT_RGB_PAIR_STEPS,
+        &DCT_RGB_COMP_QUAD,
         &ASSEMBLE_NS,
         &TOTAL_NS,
         &OUT_ALLOC_NS,
@@ -84,4 +90,14 @@ pub fn report(divisor: u64) {
         "dwa-profile: out_alloc volume = {:.1} MiB/iter",
         OUT_BYTES.load(Ordering::Relaxed) as f64 / divisor.max(1) as f64 / (1024.0 * 1024.0),
     );
+    let pair_steps = DCT_RGB_PAIR_STEPS.load(Ordering::Relaxed);
+    let comp_quad = DCT_RGB_COMP_QUAD.load(Ordering::Relaxed);
+    if pair_steps > 0 {
+        eprintln!(
+            "dwa-profile: dct rgb pair steps={}  component-quad hits={}  ({:.1}% of pair steps)",
+            pair_steps as f64 / divisor.max(1) as f64,
+            comp_quad as f64 / divisor.max(1) as f64,
+            100.0 * comp_quad as f64 / pair_steps as f64,
+        );
+    }
 }

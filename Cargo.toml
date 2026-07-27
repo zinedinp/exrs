@@ -76,6 +76,14 @@ dwa-profile = []
 # Without this feature, 32-bit ARM uses portable_wide16 (stable-safe).
 arm-neon = ["pulp/nightly"]
 
+# Opt-in Zen5 component dual-port DCT inside AVX-512 fused decode
+# (`inverse_quad(R∥G)` + pair B instead of 3× sequential `inverse_pair`).
+# Isolated microbench is +6–11%; whole-pipeline A/B on both fixtures showed
+# a small `lossy_dct` *regression* (−1 to −6%) with wall flat-to-worse, so
+# this stays off by default. Re-enable for further investigation:
+#   cargo build --release --example dwa_bench --features "dwa-profile,dwa-avx512-rgb-comp-quad"
+dwa-avx512-rgb-comp-quad = []
+
 # Override the AC-Huffman decode prefix-LUT size (huffman.rs' LUT_BITS)
 # Bigger trades fewer long-code fallbacks for more L1d pressure per DWA
 # chunk; the right choice depends the CPU L1d

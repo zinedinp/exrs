@@ -125,6 +125,24 @@ impl Coefficients {
 // Mechanical width-doubling of `avx2::row_pass` (same butterfly, f32x16
 // instead of f32x8) -- this step is purely elementwise, so it never needs to
 // know about the block-A/block-B split at all.
+//
+// Investigated and closed (2026-07-28): despite `fma` being in `v4_fn!`'s
+// target-feature set, LLVM never auto-contracts these plain mul/add pairs
+// into `vfmadd*ps` (Rust doesn't set the contract fast-math flag by
+// default). Explicitly fusing via `mul_add_f32x16` was tried and reverted:
+// bit-exactness broke (4096/4096 test blocks produced at least one differing
+// f32 vs the plain mul/add version -- single rounding vs double), and it was
+// even ~2-4% *slower* in isolation despite ~9% fewer vector instructions.
+// Root cause confirmed via `llvm-mca` (znver4/znver5 sched models): the
+// fused version isn't an LLVM codegen defect -- AMD's own port-mapping data
+// shows plain mul/add spreads across all 4 FP pipes (FP0-FP3, resource
+// pressure 65-96% each) while `vfmadd231ps` collapses almost entirely onto
+// one pipe (97% on FP1 alone), and register-dependency pressure rises
+// 17%->60%. This kernel already had enough independent mul/add work to
+// saturate 4 ports; fusing pairs into one op *removes* that port-spreading
+// opportunity. Not fixable by any pulp-side codegen change -- it's a
+// hardware port-count constraint, not a scheduling quality issue. See
+// `dwa-avx512-fma-row-pass-findings` memory.
 #[inline(always)]
 fn row_pass(v4: V4, coef: &Coefficients, input: [f32x16; 8]) -> [f32x16; 8] {
     let mul = |a, b| v4.mul_f32x16(a, b);
@@ -310,6 +328,136 @@ pulp::v4_fn! {
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Two independent `inverse_pair` chains (4 spatial blocks, 2 zmm registers),
+/// stage-interleaved by hand: both chains' transpose runs before either
+/// chain's row_pass, etc. Zen5 has two full-width 512-bit execution ports; a
+/// single `inverse_pair` chain is a strict transpose -> row_pass -> transpose
+/// -> column_pass dependency chain with nothing else in flight to fill the
+/// second port while each stage's latency drains. Placing a second,
+/// data-independent chain's same-stage instructions immediately adjacent in
+/// the source gives the scheduler two ready, port-fillable instruction
+/// streams instead of one, a source-level microbenchmark-only prototype,
+/// not wired into any dispatch path. See `dct_inverse_bench_avx512_batch_quad`
+/// in `benches/dct.rs` for the A/B against back-to-back `inverse_pair` calls
+/// (which is what today's `dct_inverse_8x8_batch` loop already produces, one
+/// pair per iteration, whatever ILP LLVM's own loop unrolling finds on its own).
+#[inline(always)]
+pub(crate) fn inverse_quad(
+    v4: V4,
+    coef: &Coefficients,
+    a0: &mut [f32; 64],
+    b0: &mut [f32; 64],
+    a1: &mut [f32; 64],
+    b1: &mut [f32; 64],
+) {
+    let rows0: [f32x16; 8] = std::array::from_fn(|row| load_pair(v4, a0, b0, row));
+    let rows1: [f32x16; 8] = std::array::from_fn(|row| load_pair(v4, a1, b1, row));
+
+    let columns0 = transpose8x8x2(v4, rows0);
+    let columns1 = transpose8x8x2(v4, rows1);
+
+    let row_pass_out0 = row_pass(v4, coef, columns0);
+    let row_pass_out1 = row_pass(v4, coef, columns1);
+
+    let intermediate_rows0 = transpose8x8x2(v4, row_pass_out0);
+    let intermediate_rows1 = transpose8x8x2(v4, row_pass_out1);
+
+    let columns_out0 = column_pass(v4, coef, intermediate_rows0);
+    let columns_out1 = column_pass(v4, coef, intermediate_rows1);
+
+    for (row, result) in columns_out0.iter().enumerate() {
+        store_pair(v4, a0, b0, row, *result);
+    }
+    for (row, result) in columns_out1.iter().enumerate() {
+        store_pair(v4, a1, b1, row, *result);
+    }
+}
+
+#[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
+pulp::v4_fn! {
+    pub fn dct_inverse_8x8_quad(
+        v4: V4,
+        a0: &mut [f32; 64],
+        b0: &mut [f32; 64],
+        a1: &mut [f32; 64],
+        b1: &mut [f32; 64],
+    ) {
+        let coef = Coefficients::new(v4);
+        inverse_quad(v4, &coef, a0, b0, a1, b1);
+    }
+}
+
+pulp::v4_fn! {
+    /// Same batching contract as `dct_inverse_8x8_batch`, but processes 4
+    /// blocks (2 pairs) per iteration through the hand-interleaved
+    /// `inverse_quad` kernel; a short trailing remainder (1-3 blocks) falls
+    /// back to `inverse_pair`/scalar. Microbenchmark-only prototype (see
+    /// `inverse_quad`'s doc comment) -- not wired into the real dispatch chain.
+    pub fn dct_inverse_8x8_batch_quad<'a>(v4: V4, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
+        let coef = Coefficients::new(v4);
+        let mut iter = blocks;
+        loop {
+            let Some(a0) = iter.next() else { break };
+            let Some(b0) = iter.next() else {
+                super::super::dct_inverse_8x8_autovectorized(a0);
+                break;
+            };
+            let Some(a1) = iter.next() else {
+                inverse_pair(v4, &coef, a0, b0);
+                break;
+            };
+            let Some(b1) = iter.next() else {
+                inverse_pair(v4, &coef, a0, b0);
+                super::super::dct_inverse_8x8_autovectorized(a1);
+                break;
+            };
+            inverse_quad(v4, &coef, a0, b0, a1, b1);
+        }
+    }
+}
+
+/// One RGB spatial pair as held by the fused AVX-512 decode step: two
+/// blocks × three components. Microbench / test fixture type only.
+pub type RgbPairBlocks = ([[f32; 64]; 3], [[f32; 64]; 3]);
+
+// Baseline shape of today's `decode_pair_dct_csc` DCT loop: three sequential
+// `inverse_pair` calls (R, then G, then B) on one spatial pair. No zigzag /
+// CSC / write — pure DCT middle step, RGB-shaped so the component-quad A/B
+// below measures the dual-port idea *without* growing the spatial working set.
+// Doc comments can't attach to `v4_fn!` expansions (unused_doc_comments).
+#[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
+pulp::v4_fn! {
+    pub fn dct_inverse_rgb_pair_components_seq(v4: V4, pairs: &mut [RgbPairBlocks]) {
+        let coef = Coefficients::new(v4);
+        for (a, b) in pairs.iter_mut() {
+            for c in 0..3 {
+                inverse_pair(v4, &coef, &mut a[c], &mut b[c]);
+            }
+        }
+    }
+}
+
+// Dual-port candidate for the same RGB pair: hand-interleave R and G through
+// `inverse_quad` (two independent 512-bit chains, same spatial pair — buffers
+// already L1-resident in the fused path), then B alone via `inverse_pair`.
+// Same total arithmetic as `dct_inverse_rgb_pair_components_seq`; only the
+// issue order changes.
+#[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
+pulp::v4_fn! {
+    pub fn dct_inverse_rgb_pair_components_quad(v4: V4, pairs: &mut [RgbPairBlocks]) {
+        let coef = Coefficients::new(v4);
+        for (a, b) in pairs.iter_mut() {
+            // split_at_mut: disjoint R/G mut refs (indexing alone won't borrow-check).
+            let (a_r, a_rest) = a.split_at_mut(1);
+            let (a_g, a_b) = a_rest.split_at_mut(1);
+            let (b_r, b_rest) = b.split_at_mut(1);
+            let (b_g, b_b) = b_rest.split_at_mut(1);
+            inverse_quad(v4, &coef, &mut a_r[0], &mut b_r[0], &mut a_g[0], &mut b_g[0]);
+            inverse_pair(v4, &coef, &mut a_b[0], &mut b_b[0]);
         }
     }
 }

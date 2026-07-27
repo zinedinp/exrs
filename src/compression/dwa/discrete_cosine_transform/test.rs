@@ -154,6 +154,51 @@ mod avx512_tests {
         assert_pairs_match(|a, b| avx512::dct_inverse_8x8_pair(expect_avx512(), a, b));
     }
 
+    /// The hand-interleaved 2-pair ("quad") kernel must produce exactly the
+    /// same result as two independent `inverse_pair` calls, interleaving
+    /// the two chains' stages is a scheduling change only, not a math change.
+    #[test]
+    fn avx512_quad_matches_pair() {
+        let blocks = pseudo_random_blocks(4096);
+        for group in blocks.chunks_exact(4) {
+            let mut expected = [group[0], group[1], group[2], group[3]];
+            let mut actual = expected;
+
+            let [ref mut ea0, ref mut eb0, ref mut ea1, ref mut eb1] = expected;
+            avx512::dct_inverse_8x8_pair(expect_avx512(), ea0, eb0);
+            avx512::dct_inverse_8x8_pair(expect_avx512(), ea1, eb1);
+
+            let [ref mut a0, ref mut b0, ref mut a1, ref mut b1] = actual;
+            avx512::dct_inverse_8x8_quad(expect_avx512(), a0, b0, a1, b1);
+
+            for (e, a) in expected.iter().zip(actual.iter()) {
+                e.to_vec().assert_approx_equals_result(&a.to_vec());
+            }
+        }
+    }
+
+    /// Component-level dual-port shape (R∥G via `inverse_quad`, then B) must
+    /// match three sequential `inverse_pair`s on the same RGB spatial pair.
+    #[test]
+    fn avx512_rgb_component_quad_matches_seq() {
+        let blocks = pseudo_random_blocks(4096 * 6);
+        let mut pairs: Vec<avx512::RgbPairBlocks> = blocks
+            .chunks_exact(6)
+            .map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]]))
+            .collect();
+        let mut expected = pairs.clone();
+
+        avx512::dct_inverse_rgb_pair_components_seq(expect_avx512(), &mut expected);
+        avx512::dct_inverse_rgb_pair_components_quad(expect_avx512(), &mut pairs);
+
+        for (e, a) in expected.iter().zip(pairs.iter()) {
+            for c in 0..3 {
+                e.0[c].to_vec().assert_approx_equals_result(&a.0[c].to_vec());
+                e.1[c].to_vec().assert_approx_equals_result(&a.1[c].to_vec());
+            }
+        }
+    }
+
     fn expect_avx512() -> V4 {
         V4::try_new().expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
     }
