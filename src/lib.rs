@@ -62,11 +62,9 @@ pub mod prelude {
             write::{channels::GetPixel, WritableImage},
         };
 
-        #[cfg(feature = "rayon")]
         pub use crate::image::read::specific_channels::RowMajorPixelStorage;
     }
 
-    #[cfg(feature = "rayon")]
     pub use crate::image::read::specific_channels::FlatRowMajorPixelStorage;
 
     // re-export external stuff

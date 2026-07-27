@@ -1,5 +1,6 @@
 extern crate exr;
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use exr::prelude::*;
@@ -39,13 +40,37 @@ fn bithash_f32(width: usize, pixels: &[[f32; 4]], mut h: u64) -> u64 {
     h
 }
 
+// Same hash again, for the `(f16, f16, f16)` tuple storage used by the
+// `half_serial` mode -- identical bit content to `bithash_half`, just a
+// different in-memory element shape.
+fn bithash_half_tuple(width: usize, pixels: &[(f16, f16, f16)], mut h: u64) -> u64 {
+    for channel_index in 0..3 {
+        for row in pixels.chunks_exact(width) {
+            for pixel in row {
+                let bits = match channel_index {
+                    0 => pixel.0,
+                    1 => pixel.1,
+                    _ => pixel.2,
+                }
+                .to_bits() as u64;
+                h ^=
+                    bits.wrapping_add(0x9e3779b97f4a7c15).wrapping_add(h << 6).wrapping_add(h >> 2);
+            }
+        }
+    }
+    h
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: {} <file> <0|1 parallel> <iters> [half|f32x4]", args[0]);
-        eprintln!("  half   three half channels, 6 bytes/pixel (default; matches");
-        eprintln!("         bench_openexr.cpp's three `Array2D<half>` planes)");
-        eprintln!("  f32x4  RGBA as f32, 16 bytes/pixel (the previous default)");
+        eprintln!("usage: {} <file> <0|1 parallel> <iters> [half|f32x4|half_serial]", args[0]);
+        eprintln!("  half         three half channels, 6 bytes/pixel (default; matches");
+        eprintln!("               bench_openexr.cpp's three `Array2D<half>` planes)");
+        eprintln!("  f32x4        RGBA as f32, 16 bytes/pixel (the previous default)");
+        eprintln!("  half_serial  same three half channels, but through the *serial*");
+        eprintln!("               `collect_pixels` API (Element = Pixel, exercises the");
+        eprintln!("               row-hoisting fast path in `SpecificChannelsReader`)");
         std::process::exit(1);
     }
 
@@ -136,8 +161,70 @@ fn main() {
             bithash_f32
         ),
 
+        // Exercises the *serial* `collect_pixels` reader (not
+        // `collect_pixels_in_parallel`) with `Element = Pixel` (identity: no
+        // half<->u16 bit-cast), so `SpecificChannelsReader::read_block`'s
+        // `RowMajorPixelStorage` fast path applies -- one hoisted row slice
+        // per scanline instead of a per-pixel `set_pixel` closure call. The
+        // pixel buffer is reused across iterations (`Cell` swap, same idiom
+        // as `examples/9_read_pixels_reusing_buffer.rs`) since `(f16, f16,
+        // f16)` is a user struct that std's `IsZero` doesn't cover -- a fresh
+        // `vec![zero; n]` here would pay the fill cost measured in
+        // `dwa-output-allocation-dominates-findings` (28-32 ms) every
+        // iteration, which would swamp the effect being measured.
+        "half_serial" => {
+            let buffer: Cell<Vec<(f16, f16, f16)>> = Cell::new(Vec::new());
+            let mut total = Duration::ZERO;
+            let mut hash = 0u64;
+
+            let mut reader = channels()
+                .required("R")
+                .required("G")
+                .required("B")
+                .collect_pixels(
+                    |resolution, _channels| {
+                        let mut pixels = buffer.take();
+                        pixels.resize(
+                            resolution.width() * resolution.height(),
+                            (f16::ZERO, f16::ZERO, f16::ZERO),
+                        );
+                        FlatRowMajorPixelStorage { width: resolution.width(), pixels }
+                    },
+                    |storage: &mut FlatRowMajorPixelStorage<(f16, f16, f16)>,
+                     pos: Vec2<usize>,
+                     pixel: (f16, f16, f16)| {
+                        let width = storage.width;
+                        storage.pixels[pos.y() * width + pos.x()] = pixel;
+                    },
+                )
+                .first_valid_layer()
+                .all_attributes();
+
+            if !parallel {
+                reader = reader.non_parallel();
+            }
+
+            for _ in 0..iters {
+                let start = Instant::now();
+
+                let pixels = reader
+                    .clone()
+                    .from_file(path)
+                    .expect("failed to read exr file")
+                    .layer_data
+                    .channel_data
+                    .pixels;
+
+                total += start.elapsed();
+                hash = bithash_half_tuple(pixels.width, &pixels.pixels, hash);
+                buffer.set(pixels.pixels);
+            }
+
+            (total, hash)
+        }
+
         other => {
-            eprintln!("unknown storage mode {:?}, expected `half` or `f32x4`", other);
+            eprintln!("unknown storage mode {:?}, expected `half`, `f32x4`, or `half_serial`", other);
             std::process::exit(1);
         }
     };
