@@ -69,6 +69,13 @@ simd-benches = []
 # adds per chunk; negligible unless you're doing this exact measurement.
 dwa-profile = []
 
+# 32-bit ARM NEON reconstruct via pulp's nightly Neon token.
+# Requires a nightly toolchain + pulp `nightly` (stdarch arm NEON is unstable).
+# Example:
+#   cargo +nightly check --target armv7-unknown-linux-gnueabihf --features arm-neon
+# Without this feature, 32-bit ARM uses portable_wide16 (stable-safe).
+arm-neon = ["pulp/nightly"]
+
 # Override the AC-Huffman decode prefix-LUT size (huffman.rs' LUT_BITS)
 # Bigger trades fewer long-code fallbacks for more L1d pressure per DWA
 # chunk; the right choice depends the CPU L1d
@@ -169,10 +176,6 @@ lto = false
 debug = 2
 codegen-units = 16
 
-# TEMPORARY: routes `pulp` to a fork that adds safe wrappers for the F16C
-# half<->float conversion intrinsics (`_mm256_cvtph_ps` and friends), which
-# upstream pulp does not expose yet, plus the `v4_fn!` macro (avoids the
-# vectorize()-closure inlining trap for large AVX-512 kernels).
 [patch.crates-io]
 pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "V4-vectorize-in-target-feature" }
 
