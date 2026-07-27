@@ -387,6 +387,7 @@ ReadChannels<'s> for CollectPixels<InnerChannels, Pixel, PixelStorage, CreatePix
             set_pixel: &self.set_pixel,
             pixel_storage,
             pixel_reader,
+            line_pixels: Vec::new(),
             px: Default::default()
         })
     }
@@ -425,6 +426,7 @@ ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage,
             set_row_pixel: &self.set_row_pixel,
             pixel_storage,
             pixel_reader,
+            line_pixels: Vec::new(),
             px: Default::default()
         })
     }
@@ -432,11 +434,16 @@ ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage,
 
 /// The reader that holds the temporary data that is required to read some
 /// specified channels.
-#[derive(Copy, Clone, Debug)]
-pub struct SpecificChannelsReader<PixelStorage, SetPixel, PixelReader, Pixel> {
+#[derive(Clone, Debug)]
+pub struct SpecificChannelsReader<PixelStorage, SetPixel, PixelReader, Pixel>
+where
+    PixelReader: RecursivePixelReader,
+{
     set_pixel: SetPixel,
     pixel_storage: PixelStorage,
     pixel_reader: PixelReader,
+    /// Converted-pixel scratch reused across blocks (grows to `LINE_RUN_PIXELS`).
+    line_pixels: Vec<PixelReader::RecursivePixel>,
     px: PhantomData<Pixel>,
 }
 
@@ -469,7 +476,9 @@ where
         // channel planes are addressed from `line_width`, so splitting the line
         // does not change which bytes are read.
         let run_width = LINE_RUN_PIXELS.min(line_width);
-        let mut pixels = vec![PxReader::RecursivePixel::default(); run_width]; // TODO allocate once in self
+        if self.line_pixels.len() < run_width {
+            self.line_pixels.resize(run_width, PxReader::RecursivePixel::default());
+        }
 
         let byte_lines =
             block.data.chunks_exact(header.channels.bytes_per_pixel * line_width);
@@ -483,7 +492,7 @@ where
         for (y_offset, line_bytes) in byte_lines.enumerate() {
             // TODO sampling
             for x_start in (0..line_width).step_by(run_width) {
-                let run = &mut pixels[..run_width.min(line_width - x_start)];
+                let run = &mut self.line_pixels[..run_width.min(line_width - x_start)];
 
                 // this two-step copy method should be very cache friendly in theory, and also
                 // reduce sample_type lookup count
@@ -523,11 +532,16 @@ where
 /// `PixelStorage: RowMajorPixelStorage` lets its rows be split into
 /// disjoint, independently-writable ranges.
 #[cfg(feature = "rayon")]
-#[derive(Copy, Clone, Debug)]
-pub struct SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PixelReader, Pixel> {
+#[derive(Clone, Debug)]
+pub struct SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PixelReader, Pixel>
+where
+    PixelReader: RecursivePixelReader,
+{
     set_row_pixel: SetRowPixel,
     pixel_storage: PixelStorage,
     pixel_reader: PixelReader,
+    /// Scratch for serial `read_block` / non-parallel fallback (workers keep their own).
+    line_pixels: Vec<PixelReader::RecursivePixel>,
     px: PhantomData<Pixel>,
 }
 
@@ -559,11 +573,15 @@ where
     // row-major buffer) and calling `set_row_pixel(row, x, pixel)` instead of
     // `set_pixel(storage, position, pixel)`.
     fn read_block(&mut self, header: &Header, block: UncompressedBlock) -> UnitResult {
-        let mut pixels = vec![PxReader::RecursivePixel::default(); block.index.pixel_size.width()];
+        let line_width = block.index.pixel_size.width();
+        if self.line_pixels.len() < line_width {
+            self.line_pixels.resize(line_width, PxReader::RecursivePixel::default());
+        }
+        let pixels = &mut self.line_pixels[..line_width];
 
         let byte_lines = block
             .data
-            .chunks_exact(header.channels.bytes_per_pixel * block.index.pixel_size.width());
+            .chunks_exact(header.channels.bytes_per_pixel * line_width);
         debug_assert_eq!(
             byte_lines.len(),
             block.index.pixel_size.height(),
@@ -572,16 +590,16 @@ where
 
         let storage_width = self.pixel_storage.width();
         let flat = self.pixel_storage.pixels_mut();
+        let x0 = block.index.pixel_position.x();
 
-        let line_width = pixels.len();
         for (y_offset, line_bytes) in byte_lines.enumerate() {
-            self.pixel_reader.read_pixels(line_bytes, line_width, 0, &mut pixels, |px| px);
+            self.pixel_reader.read_pixels(line_bytes, line_width, 0, pixels, |px| px);
             let y = block.index.pixel_position.y() + y_offset;
             let row = &mut flat[y * storage_width .. (y + 1) * storage_width];
 
             for (x_offset, pixel) in pixels.iter().enumerate() {
                 let set_row_pixel = &self.set_row_pixel;
-                set_row_pixel(row, block.index.pixel_position.x() + x_offset, pixel.into_tuple());
+                set_row_pixel(row, x0 + x_offset, pixel.into_tuple());
             }
         }
 
