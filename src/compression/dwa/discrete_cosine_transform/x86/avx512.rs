@@ -126,24 +126,18 @@ impl Coefficients {
 // instead of f32x8) -- this step is purely elementwise, so it never needs to
 // know about the block-A/block-B split at all.
 //
-// Investigated and closed (2026-07-28): despite `fma` being in `v4_fn!`'s
-// target-feature set, LLVM never auto-contracts these plain mul/add pairs
-// into `vfmadd*ps` (Rust doesn't set the contract fast-math flag by
-// default). Explicitly fusing via `mul_add_f32x16` was tried and reverted:
+// Fusing via `mul_add_f32x16` was tried and reverted:
 // bit-exactness broke (4096/4096 test blocks produced at least one differing
-// f32 vs the plain mul/add version -- single rounding vs double), and it was
+// f32 vs the plain mul/add version, single rounding vs double), and it was
 // even ~2-4% *slower* in isolation despite ~9% fewer vector instructions.
 // Root cause confirmed via `llvm-mca` (znver4/znver5 sched models): the
-// fused version isn't an LLVM codegen defect -- AMD's own port-mapping data
+// fused version isn't an LLVM codegen defect -> AMD's own port-mapping data
 // shows plain mul/add spreads across all 4 FP pipes (FP0-FP3, resource
 // pressure 65-96% each) while `vfmadd231ps` collapses almost entirely onto
 // one pipe (97% on FP1 alone), and register-dependency pressure rises
 // 17%->60%. This kernel already had enough independent mul/add work to
 // saturate 4 ports; fusing pairs into one op *removes* that port-spreading
-// opportunity. Not fixable by any pulp-side codegen change -- it's a
-// hardware port-count constraint, not a scheduling quality issue. See
-// `dwa-avx512-fma-row-pass-findings` memory.
-#[inline(always)]
+// opportunity.
 fn row_pass(v4: V4, coef: &Coefficients, input: [f32x16; 8]) -> [f32x16; 8] {
     let mul = |a, b| v4.mul_f32x16(a, b);
     let add = |a, b| v4.add_f32x16(a, b);
@@ -396,7 +390,7 @@ pulp::v4_fn! {
     /// blocks (2 pairs) per iteration through the hand-interleaved
     /// `inverse_quad` kernel; a short trailing remainder (1-3 blocks) falls
     /// back to `inverse_pair`/scalar. Microbenchmark-only prototype (see
-    /// `inverse_quad`'s doc comment) -- not wired into the real dispatch chain.
+    /// `inverse_quad`'s doc comment), not wired into the real dispatch chain.
     pub fn dct_inverse_8x8_batch_quad<'a>(v4: V4, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
         let coef = Coefficients::new(v4);
         let mut iter = blocks;
@@ -426,9 +420,8 @@ pub type RgbPairBlocks = ([[f32; 64]; 3], [[f32; 64]; 3]);
 
 // Baseline shape of today's `decode_pair_dct_csc` DCT loop: three sequential
 // `inverse_pair` calls (R, then G, then B) on one spatial pair. No zigzag /
-// CSC / write — pure DCT middle step, RGB-shaped so the component-quad A/B
+// CSC / write, pure DCT middle step, RGB-shaped so the component-quad A/B
 // below measures the dual-port idea *without* growing the spatial working set.
-// Doc comments can't attach to `v4_fn!` expansions (unused_doc_comments).
 #[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
 pulp::v4_fn! {
     pub fn dct_inverse_rgb_pair_components_seq(v4: V4, pairs: &mut [RgbPairBlocks]) {
@@ -442,7 +435,7 @@ pulp::v4_fn! {
 }
 
 // Dual-port candidate for the same RGB pair: hand-interleave R and G through
-// `inverse_quad` (two independent 512-bit chains, same spatial pair — buffers
+// `inverse_quad` (two independent 512-bit chains, same spatial pair, buffers
 // already L1-resident in the fused path), then B alone via `inverse_pair`.
 // Same total arithmetic as `dct_inverse_rgb_pair_components_seq`; only the
 // issue order changes.
@@ -460,4 +453,75 @@ pulp::v4_fn! {
             inverse_pair(v4, &coef, &mut a_b[0], &mut b_b[0]);
         }
     }
+}
+
+// TEMPORARY (2026-07-28 pulp VBMI2 smoke test, not for shipping): exercises
+// the newly-added `pulp::x86::V4Vbmi2` capability type and its
+// `mask_compress_u16x32`/`mask_expand_u16x32` wrappers (vendored fork,
+// `V4-vectorize-in-target-feature` branch) against a scalar reference, to
+// confirm the new fork infrastructure actually executes correctly on real
+// hardware and not just compiles.
+#[cfg(all(test, feature = "avx512-tests"))]
+mod vbmi2_probe {
+    use pulp::{b32, cast, x86::V4Vbmi2};
+
+    pulp::v4_vbmi2_fn! {
+        fn compress(v4: V4Vbmi2, mask: u32, a: [u16; 32]) -> [u16; 32] {
+            cast!(v4.mask_compress_u16x32(b32(mask), cast!(a)))
+        }
+    }
+
+    pulp::v4_vbmi2_fn! {
+        fn expand(v4: V4Vbmi2, mask: u32, a: [u16; 32]) -> [u16; 32] {
+            cast!(v4.mask_expand_u16x32(b32(mask), cast!(a)))
+        }
+    }
+
+    fn scalar_compress(mask: u32, a: [u16; 32]) -> [u16; 32] {
+        let mut out = [0u16; 32];
+        let mut dst = 0;
+        for i in 0..32 {
+            if (mask >> i) & 1 == 1 {
+                out[dst] = a[i];
+                dst += 1;
+            }
+        }
+        out
+    }
+
+    fn scalar_expand(mask: u32, a: [u16; 32]) -> [u16; 32] {
+        let mut out = [0u16; 32];
+        let mut src = 0;
+        for i in 0..32 {
+            if (mask >> i) & 1 == 1 {
+                out[i] = a[src];
+                src += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn vbmi2_compress_expand_match_scalar_reference() {
+        let Some(v4) = V4Vbmi2::try_new() else {
+            // Skylake-X/Cascade Lake-class hosts have V4 but not VBMI2
+            // this is exactly the case V4Vbmi2 exists to guard against.
+            return;
+        };
+
+        let mut random = rand::rngs::StdRng::seed_from_u64(0x7645_1e3e);
+
+        for _ in 0..4096 {
+            let mask: u32 = random.random();
+            let mut a = [0u16; 32];
+            for slot in a.iter_mut() {
+                *slot = random.random();
+            }
+
+            assert_eq!(compress(v4, mask, a), scalar_compress(mask, a));
+            assert_eq!(expand(v4, mask, a), scalar_expand(mask, a));
+        }
+    }
+
+    use rand::{RngExt, SeedableRng};
 }
