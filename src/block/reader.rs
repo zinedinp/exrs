@@ -514,6 +514,26 @@ pub struct ParallelBlockDecompressor<R: ChunksReader> {
     pedantic: bool,
 
     pool: rayon_core::ThreadPool,
+
+    /// Start of this decompressor's life, so `Drop` can record the wall-clock
+    /// span the scheduling counters in `dwa::profile` are relative to.
+    #[cfg(feature = "dwa-profile")]
+    profile_started: std::time::Instant,
+}
+
+#[cfg(all(feature = "rayon", feature = "dwa-profile"))]
+impl<R: ChunksReader> Drop for ParallelBlockDecompressor<R> {
+    fn drop(&mut self) {
+        use crate::compression::dwa::profile;
+        use std::sync::atomic::Ordering;
+
+        profile::SCHED_WALL_NS.fetch_add(
+            self.profile_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        profile::SCHED_THREADS
+            .store(self.pool.current_num_threads() as u64, Ordering::Relaxed);
+    }
 }
 
 #[cfg(feature = "rayon")]
@@ -579,12 +599,18 @@ impl<R: ChunksReader> ParallelBlockDecompressor<R> {
             max_threads,
 
             pool,
+
+            #[cfg(feature = "dwa-profile")]
+            profile_started: std::time::Instant::now(),
         })
     }
 
     /// Fill the pool with decompression jobs. Returns the first job that
     /// finishes.
     pub fn decompress_next_block(&mut self) -> Option<Result<UncompressedBlock>> {
+        #[cfg(feature = "dwa-profile")]
+        let feed_start = std::time::Instant::now();
+
         while self.currently_decompressing_count < self.max_threads {
             let block = self.remaining_chunks.next();
             if let Some(block) = block {
@@ -599,9 +625,31 @@ impl<R: ChunksReader> ParallelBlockDecompressor<R> {
 
                 self.currently_decompressing_count += 1;
 
+                // Timestamped at `spawn` so the worker can report how long the
+                // chunk sat in the pool's queue before anyone picked it up.
+                #[cfg(feature = "dwa-profile")]
+                let spawned_at = std::time::Instant::now();
+
                 self.pool.spawn(move || {
+                    #[cfg(feature = "dwa-profile")]
+                    {
+                        use crate::compression::dwa::profile;
+                        use std::sync::atomic::Ordering;
+                        profile::SCHED_QUEUE_NS
+                            .fetch_add(spawned_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        profile::SCHED_TASKS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    #[cfg(feature = "dwa-profile")]
+                    let task_start = std::time::Instant::now();
+
                     let decompressed_or_err =
                         UncompressedBlock::decompress_chunk(block, &meta, pedantic);
+
+                    #[cfg(feature = "dwa-profile")]
+                    crate::compression::dwa::profile::SCHED_TASK_NS.fetch_add(
+                        task_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
 
                     // by now, decompressing could have failed in another thread.
                     // the error is then already handled, so we simply
@@ -614,11 +662,26 @@ impl<R: ChunksReader> ParallelBlockDecompressor<R> {
             }
         }
 
+        #[cfg(feature = "dwa-profile")]
+        crate::compression::dwa::profile::SCHED_FEED_NS.fetch_add(
+            feed_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         if self.currently_decompressing_count > 0 {
+            #[cfg(feature = "dwa-profile")]
+            let recv_start = std::time::Instant::now();
+
             let next = self
                 .receiver
                 .recv()
                 .expect("all decompressing senders hung up but more messages were expected");
+
+            #[cfg(feature = "dwa-profile")]
+            crate::compression::dwa::profile::SCHED_RECV_NS.fetch_add(
+                recv_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             self.currently_decompressing_count -= 1;
             Some(next)

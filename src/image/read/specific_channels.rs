@@ -660,7 +660,22 @@ where
         let total_rows = if storage_width == 0 { 0 } else { flat.len() / storage_width };
         let mut cursor = 0usize;
 
+        // Scheduling instrumentation (see `dwa::profile`'s SCHED_* counters).
+        // Note `ThreadPool::scope` runs the feeding closure *on a pool worker*,
+        // not on the calling thread, so the feeder occupies one of the N threads
+        // for the whole span -- which is why `main_feed` is reported next to
+        // worker busy time rather than treated as free.
+        #[cfg(feature = "dwa-profile")]
+        let scope_start = std::time::Instant::now();
+        #[cfg(feature = "dwa-profile")]
+        let mut feed_ns = 0u64;
+        #[cfg(feature = "dwa-profile")]
+        let feed_ns = &mut feed_ns;
+
         pool.scope(|scope| {
+            #[cfg(feature = "dwa-profile")]
+            let mut feed_mark = std::time::Instant::now();
+
             while let Some(chunk) = chunks.next() {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
@@ -686,7 +701,24 @@ where
                 cursor = y + height;
 
                 let error = &error;
+
+                #[cfg(feature = "dwa-profile")]
+                let spawned_at = std::time::Instant::now();
+
                 scope.spawn(move |_| {
+                    #[cfg(feature = "dwa-profile")]
+                    let task_start = {
+                        use crate::compression::dwa::profile;
+                        use std::sync::atomic::Ordering;
+                        let now = std::time::Instant::now();
+                        profile::SCHED_QUEUE_NS.fetch_add(
+                            now.duration_since(spawned_at).as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        profile::SCHED_TASKS.fetch_add(1, Ordering::Relaxed);
+                        now
+                    };
+
                     let result = UncompressedBlock::decompress_chunk(chunk, meta_data, pedantic)
                         .and_then(|block| {
                             let mut pixels = vec![PxReader::RecursivePixel::default(); width];
@@ -717,9 +749,36 @@ where
                     if let Err(new_error) = result {
                         *error.lock().unwrap() = Some(new_error);
                     }
+
+                    #[cfg(feature = "dwa-profile")]
+                    crate::compression::dwa::profile::SCHED_TASK_NS.fetch_add(
+                        task_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 });
+
+                #[cfg(feature = "dwa-profile")]
+                {
+                    let now = std::time::Instant::now();
+                    *feed_ns += now.duration_since(feed_mark).as_nanos() as u64;
+                    feed_mark = now;
+                }
             }
         });
+
+        // Everything inside the scope that wasn't the feeding loop is the
+        // feeder parked on the scope latch waiting for stragglers -- the
+        // tail-imbalance cost of the last wave of chunks.
+        #[cfg(feature = "dwa-profile")]
+        {
+            use crate::compression::dwa::profile;
+            use std::sync::atomic::Ordering;
+            let wall = scope_start.elapsed().as_nanos() as u64;
+            profile::SCHED_WALL_NS.fetch_add(wall, Ordering::Relaxed);
+            profile::SCHED_FEED_NS.fetch_add(*feed_ns, Ordering::Relaxed);
+            profile::SCHED_DRAIN_NS.fetch_add(wall.saturating_sub(*feed_ns), Ordering::Relaxed);
+            profile::SCHED_THREADS.store(pool.current_num_threads() as u64, Ordering::Relaxed);
+        }
 
         match error.into_inner().unwrap() {
             Some(error) => Err(error),

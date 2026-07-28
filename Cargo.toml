@@ -69,6 +69,11 @@ simd-benches = []
 # adds per chunk; negligible unless you're doing this exact measurement.
 dwa-profile = []
 
+# Let `EXRS_SIMD_TIER=scalar|sse|avx2|avx512` cap the x86 SIMD tier that the
+# compression codecs dispatch to, so one binary can be swept across all four
+# tiers on the same host
+simd-tier-env = []
+
 # 32-bit ARM NEON reconstruct via pulp's nightly Neon token.
 # Requires a nightly toolchain + pulp `nightly` (stdarch arm NEON is unstable).
 # Example:

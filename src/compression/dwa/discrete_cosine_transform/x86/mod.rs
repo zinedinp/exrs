@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 
-use pulp::x86::{V1, V3};
+use crate::compression::simd_tier::x86::{v1, v3};
 
 // public only for benchmarking
 #[doc(hidden)]
@@ -47,11 +47,11 @@ pub(super) fn try_dct_forward_8x8_batch<'a, I>(blocks: &mut I) -> bool
 where
     I: Iterator<Item = &'a mut [f32; 64]>,
 {
-    if let Some(v3) = V3::try_new() {
+    if let Some(v3) = v3() {
         avx2::dct_forward_8x8_batch(v3, blocks);
         return true;
     }
-    if let Some(v1) = V1::try_new() {
+    if let Some(v1) = v1() {
         for data in blocks {
             sse2::dct_forward_8x8(v1, data);
         }
@@ -64,11 +64,11 @@ pub(super) fn try_dct_inverse_8x8_batch<'a, I>(blocks: &mut I) -> bool
 where
     I: Iterator<Item = &'a mut [f32; 64]>,
 {
-    if let Some(v3) = V3::try_new() {
+    if let Some(v3) = v3() {
         avx2::dct_inverse_8x8_batch(v3, blocks);
         return true;
     }
-    if let Some(v1) = V1::try_new() {
+    if let Some(v1) = v1() {
         for data in blocks {
             sse2::dct_inverse_8x8(v1, data);
         }

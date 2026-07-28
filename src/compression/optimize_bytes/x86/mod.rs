@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 
 use pulp::x86::{V2, V3, V4};
 
+use crate::compression::simd_tier::x86::{v2 as tier_v2, v3 as tier_v3, v4 as tier_v4};
+
 // public only for benchmarking / correctness tests
 #[doc(hidden)]
 pub mod avx2;
@@ -50,10 +52,10 @@ enum Tier {
 fn resolved_tier() -> Tier {
     static TIER: OnceLock<Tier> = OnceLock::new();
     *TIER.get_or_init(|| {
-        V4::try_new()
+        tier_v4()
             .map(Tier::Avx512)
-            .or_else(|| V3::try_new().map(Tier::Avx2))
-            .or_else(|| V2::try_new().map(Tier::Sse))
+            .or_else(|| tier_v3().map(Tier::Avx2))
+            .or_else(|| tier_v2().map(Tier::Sse))
             .unwrap_or(Tier::Scalar)
     })
 }

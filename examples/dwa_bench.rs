@@ -79,6 +79,12 @@ fn main() {
     let iters: usize = args[3].parse().expect("iters must be a number");
     let storage = args.get(4).map(String::as_str).unwrap_or("half");
 
+    // The bithash streams the entire decoded image again (~200 MB for the 8K
+    // fixture) outside the timed region. That is invisible to `avg_ms` but very
+    // visible to whole-process hardware counters, so a perf pass can turn it off
+    // and measure the decode alone. Correctness runs leave it on.
+    let hash_enabled = std::env::var_os("DWA_BENCH_NO_HASH").is_none();
+
     #[cfg(feature = "dwa-profile")]
     exr::compression::dwa::profile::reset();
 
@@ -110,7 +116,9 @@ fn main() {
                     .pixels;
 
                 total += start.elapsed();
-                hash = $hash(pixels.width, &pixels.pixels, hash);
+                if hash_enabled {
+                    hash = $hash(pixels.width, &pixels.pixels, hash);
+                }
             }
 
             (total, hash)
@@ -216,7 +224,9 @@ fn main() {
                     .pixels;
 
                 total += start.elapsed();
-                hash = bithash_half_tuple(pixels.width, &pixels.pixels, hash);
+                if hash_enabled {
+                    hash = bithash_half_tuple(pixels.width, &pixels.pixels, hash);
+                }
                 buffer.set(pixels.pixels);
             }
 
@@ -230,11 +240,12 @@ fn main() {
     };
 
     println!(
-        "file={} parallel={} iters={} storage={} avg_ms={:.3} bithash={:016x}",
+        "file={} parallel={} iters={} storage={} simd_tier={} avg_ms={:.3} bithash={:016x}",
         path,
         parallel,
         iters,
         storage,
+        exr::compression::simd_tier::cap_name(),
         total.as_secs_f64() * 1000.0 / iters as f64,
         hash
     );
