@@ -32,12 +32,10 @@ fn u32x16_to_array(v: u32x16) -> [u32; LANES] {
 	]
 }
 
-/// Vectorized alternative to `ac_rle::un_rle_ac`'s fast path (used when
-/// `ac.remaining() >= MAX_TOKENS_PER_BLOCK`). Same contract: `block` must
-/// already be zeroed, returns the zig-zag index of the last non-zero value
-/// written (0 if none). Panics under the same "malformed stream" condition
-/// the scalar fast path panics under (more tokens needed than the format's
-/// own 63-token-per-block invariant allows).
+// Vectorized alternative to `ac_rle::un_rle_ac`'s fast path (used when
+// `ac.remaining() >= MAX_TOKENS_PER_BLOCK`). Same contract: `block` must
+// already be zeroed, returns the zig-zag index of the last non-zero value
+// written (0 if none).
 pulp::v4_fn! {
 	pub(crate) fn un_rle_ac_v4(v4: V4, ac: &mut PackedStream<'_>, block: &mut [u16; 64]) -> usize {
 		let fast = ac.peek_slice(MAX_TOKENS_PER_BLOCK);
@@ -150,16 +148,16 @@ pulp::v4_fn! {
 	}
 }
 
-/// Same classify + prefix-sum front end as `un_rle_ac_v4`, but instead of a
-/// masked `scatter_u32x16` into a `u32` shadow buffer (measured ~2x slower
-/// than the scalar loop -- AVX-512 scatter is a microcoded, per-active-lane
-/// instruction, and an average sparse block only has a handful of literals
-/// to place), this compacts each chunk's literal positions and values to a
-/// contiguous prefix with VBMI2 `mask_compress_u16x32` (already shipped in
-/// the pulp fork), then writes them with a plain unconditional loop over
-/// exactly `popcount(literal_bits)` elements -- no per-token branch (the
-/// loop's trip count is a simple counter, not content-dependent
-/// classification) and no shadow buffer, straight into `block`.
+// Same classify + prefix-sum front end as `un_rle_ac_v4`, but instead of a
+// masked `scatter_u32x16` into a `u32` shadow buffer (measured ~2x slower
+// than the scalar loop -> AVX-512 scatter is a microcoded, per-active-lane
+// instruction, and an average sparse block only has a handful of literals
+// to place), this compacts each chunk's literal positions and values to a
+// contiguous prefix with VBMI2 `mask_compress_u16x32`,
+// then writes them with a plain unconditional loop over
+// exactly `popcount(literal_bits)` elements (the
+// loop's trip count is a simple counter, not content-dependent
+// classification) and no shadow buffer, straight into `block`.
 pulp::v4_vbmi2_fn! {
 	pub(crate) fn un_rle_ac_v4_compress(v4: V4Vbmi2, ac: &mut PackedStream<'_>, block: &mut [u16; 64]) -> usize {
 		let fast = ac.peek_slice(MAX_TOKENS_PER_BLOCK);

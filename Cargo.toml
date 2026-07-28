@@ -113,6 +113,10 @@ required-features = ["rayon"]
 name = "tiled_bench"
 required-features = ["rayon"]
 
+[[example]]
+name = "dct_rgb_comp_quad_bench"
+required-features = ["simd-benches"]
+
 [[bench]]
 name = "read"
 harness = false
