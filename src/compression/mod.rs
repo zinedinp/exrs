@@ -12,6 +12,8 @@ pub(crate) mod huffman;
 mod piz;
 mod pxr24;
 mod rle;
+#[cfg(test)]
+mod rle_encode_experiment;
 
 // Runtime SIMD tier cap for benchmarking. Public so benchmark harnesses can
 // report which tier a run actually used; a no-op unless `simd-tier-env` is on.

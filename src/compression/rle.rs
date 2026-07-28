@@ -1,3 +1,5 @@
+use std::convert::TryInto;
+
 use super::{optimize_bytes::*, Error, Result, *};
 
 // inspired by  https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfRle.cpp
@@ -110,15 +112,9 @@ pub fn compress_bytes(
 pub(super) fn pack_rle_tokens(data_le: &[u8]) -> ByteVec {
     let mut compressed_le = crate::block::pool::take_with_capacity(data_le.len());
     let mut run_start = 0;
-    let mut run_end = 1;
 
     while run_start < data_le.len() {
-        while run_end < data_le.len()
-            && data_le[run_start] == data_le[run_end]
-            && ((run_end - run_start) as i32) - 1 < (MAX_RUN_LENGTH as i32)
-        {
-            run_end += 1;
-        }
+        let mut run_end = run_start + run_length_at(data_le, run_start);
 
         if run_end - run_start >= MIN_RUN_LENGTH {
             compressed_le.push((((run_end - run_start) as i32) - 1) as u8);
@@ -139,11 +135,50 @@ pub(super) fn pack_rle_tokens(data_le: &[u8]) -> ByteVec {
             compressed_le.extend_from_slice(&data_le[run_start..run_end]);
 
             run_start = run_end;
-            run_end += 1;
         }
     }
 
     compressed_le
+}
+
+/// How many consecutive bytes starting at `start` equal `data[start]`,
+/// capped at `MAX_RUN_LENGTH + 1` (the actual achievable repeat-run length --
+/// OpenEXR caps a single repeat token at 128 bytes; `MAX_RUN_LENGTH` itself
+/// is 127, one less, because the original loop's `(run_end - run_start) - 1
+/// < MAX_RUN_LENGTH` bound lets one extra byte through). Always >= 1, since
+/// `data[start]` trivially matches itself.
+///
+/// Wordwise (SWAR): compares up to 8 bytes at once against a broadcast
+/// target via XOR + `trailing_zeros`, instead of one byte per iteration.
+/// Real content is a mix of short literal runs
+/// and long flat runs
+/// (constant-color regions: mattes, alpha, skies), where cutting iterations
+/// up to 8x is a real, measured win. See `rle_encode_experiment` for the
+/// isolated A/B this was benchmark-gated on before shipping here.
+pub(super) fn run_length_at(data: &[u8], start: usize) -> usize {
+    let target = data[start];
+    let limit = (data.len() - start).min(MAX_RUN_LENGTH + 1);
+    let region = &data[start..start + limit];
+    let pattern = u64::from_le_bytes([target; 8]);
+
+    let mut count = 0usize;
+    let mut chunks = region.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        let diff = word ^ pattern;
+        if diff == 0 {
+            count += 8;
+        } else {
+            return count + (diff.trailing_zeros() / 8) as usize;
+        }
+    }
+    for &byte in chunks.remainder() {
+        if byte != target {
+            return count;
+        }
+        count += 1;
+    }
+    count
 }
 
 fn take_1(slice: &mut &[u8]) -> Result<u8> {
@@ -163,5 +198,91 @@ fn take_n<'s>(slice: &mut &'s [u8], n: usize) -> Result<&'s [u8]> {
         Ok(front)
     } else {
         Err(Error::invalid("compressed data"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn assert_roundtrips(data: &[u8]) {
+        let packed = pack_rle_tokens(data);
+        let unpacked = unpack_rle_tokens(&packed, data.len(), true).unwrap();
+        assert_eq!(data, &unpacked[..], "roundtrip failed for {} bytes", data.len());
+    }
+
+    /// Exercises the exact boundary the widened `run_length_at` has to get
+    /// right: OpenEXR's repeat token caps a run at 128 bytes even though
+    /// `MAX_RUN_LENGTH` is 127 (see `run_length_at`'s doc comment) > lengths
+    /// just below/at/above that boundary are where an off-by-one would hide.
+    #[test]
+    fn run_length_boundary_lengths_roundtrip() {
+        for &len in &[1usize, 2, 3, 4, 63, 64, 65, 126, 127, 128, 129, 130, 255, 256, 257, 1000] {
+            assert_roundtrips(&vec![7u8; len]);
+        }
+    }
+
+    #[test]
+    fn empty_roundtrips() {
+        assert_roundtrips(&[]);
+    }
+
+    #[test]
+    fn no_repeats_roundtrips() {
+        let data: Vec<u8> = (0..500).map(|i| (i * 37) as u8).collect();
+        assert_roundtrips(&data);
+    }
+
+    #[test]
+    fn mixed_runs_and_literals_roundtrips() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        for _ in 0..200 {
+            let mut data = Vec::new();
+            while data.len() < 4000 {
+                if rng.random_range(0.0..1.0) < 0.3 {
+                    let run_len = rng.random_range(1..=140);
+                    let value = rng.random::<u8>();
+                    data.extend(std::iter::repeat(value).take(run_len));
+                } else {
+                    data.push(rng.random::<u8>());
+                }
+            }
+            assert_roundtrips(&data);
+        }
+    }
+
+    /// `run_length_at` itself must never report a length that isn't actually
+    /// backed by matching bytes, and must never exceed the 128-byte cap.
+    #[test]
+    fn run_length_at_matches_naive_scan() {
+        fn naive(data: &[u8], start: usize) -> usize {
+            let target = data[start];
+            let limit = (data.len() - start).min(MAX_RUN_LENGTH + 1);
+            let mut len = 1;
+            while len < limit && data[start + len] == target {
+                len += 1;
+            }
+            len
+        }
+
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut data = Vec::new();
+        while data.len() < 20_000 {
+            if rng.random_range(0.0..1.0) < 0.4 {
+                let run_len = rng.random_range(1..=140);
+                let value = rng.random::<u8>();
+                data.extend(std::iter::repeat(value).take(run_len));
+            } else {
+                data.push(rng.random::<u8>());
+            }
+        }
+
+        for start in 0..data.len() {
+            let got = run_length_at(&data, start);
+            assert!(got >= 1 && got <= MAX_RUN_LENGTH + 1);
+            assert_eq!(got, naive(&data, start), "start={start}");
+        }
     }
 }

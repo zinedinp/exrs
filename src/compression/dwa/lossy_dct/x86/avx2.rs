@@ -1,25 +1,7 @@
-// AVX2 (V3) + F16C tier: one spatial 8x8 block per step. The zig-zag undo is
-// ported from OpenEXR's `fromHalfZigZag_f16c` (internal_dwa_simd.h): a fixed
-// shuffle network instead of a scalar gather, then F16C to widen the halves
-// to f32.
-//
-// Also hosts the fused per-block decode path (`decode_group_fused`): one
-// spatial 8x8 (or RGB triplet) runs unRLE -> zigzag -> iDCT -> CSC -> write
-// while the ~1 KiB working set stays L1-hot, instead of four passes over a
-// wide strip tile.
-//
-// `zigzag_block` and `write_block` are also called from `avx512.rs`'s fused
-// path: zigzag always runs per-block on this tier (there is no AVX-512
-// zigzag), and any block that can't take the paired DCT/CSC kernel (the
-// DC-only half of a pair, an odd trailing block) falls back to these same
-// single-block functions -- the AVX-512 fused decode is built on top of
-// this file, not a separate reimplementation.
-//
-// An SSE2-only variant of this fusion (no F16C, so scalar zigzag/half
-// conversion) was prototyped and benchmarked: it was a small (~1-1.5%) but
-// consistent and reproducible *regression* against the existing strip-tiled
-// SSE2 path, not a win, because that path's `STRIP_BLOCK_COLS` x-tiling
-// already solves the L1-residency problem fusion targets. Not shipped.
+// AVX2+F16C: one 8x8/step. Zigzag = OpenEXR `fromHalfZigZag_f16c` shuffle +
+// F16C widen. `decode_group_fused` keeps unRLE→write L1-hot (~1 KiB/block).
+// `zigzag_block`/`write_block` also serve avx512 (no AVX-512 zigzag; DC-only /
+// odd tail fallback). SSE2 fusion was a ~1% regression vs strip-tile — unshipped.
 
 use std::convert::TryInto;
 
@@ -36,7 +18,7 @@ use crate::{
     meta::attribute::SampleType,
 };
 
-use super::super::{quantization::un_rle_ac, PackedStream, ScanlineTarget};
+use super::super::{ac_rle::un_rle_ac, PackedStream, ScanlineTarget};
 use super::ROUND_TO_NEAREST;
 
 /// Un-RLE + un-zigzag one spatial block into `dct_blocks`. `needs_inverse`
@@ -485,10 +467,7 @@ mod test {
         }
     }
 
-    /// A wide, pseudo-random sweep across the full f32 bit space (every
-    /// exponent/mantissa/sign region gets hit, not just small values near
-    /// zero), plus explicit special values DCT output could plausibly
-    /// produce or a table lookup could return.
+    /// A wide, pseudo-random sweep across the full f32 bit space
     fn sweep_rows() -> impl Iterator<Item = [f32; 8]> {
         let special = [
             0.0f32,

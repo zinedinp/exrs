@@ -190,7 +190,7 @@ debug = 2
 codegen-units = 16
 
 [patch.crates-io]
-pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "V4-vectorize-in-target-feature" }
+pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "main" }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = { version = "11.6.0", default-features = false }

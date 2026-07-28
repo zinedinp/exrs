@@ -16,6 +16,7 @@ use crate::{
     meta::attribute::SampleType,
 };
 
+mod ac_rle;
 mod half_float_quantizer;
 mod quantization;
 mod transfer_curve;
@@ -23,9 +24,8 @@ mod transfer_curve;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
-use quantization::{
-    from_half_zigzag, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
-};
+use ac_rle::{rle_ac, un_rle_ac};
+use quantization::{from_half_zigzag, quantize_coefficients_to_zigzag, QuantTables};
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
 pub(super) fn encode_lossy_channels(
