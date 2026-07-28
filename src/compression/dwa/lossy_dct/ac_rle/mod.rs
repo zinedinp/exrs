@@ -28,10 +28,7 @@ pub(super) fn rle_ac(block: &[u16; 64], ac: &mut Vec<u16>) {
             continue;
         }
 
-        let mut run_len = 1;
-        while dct_comp + run_len < 64 && block[dct_comp + run_len] == 0 {
-            run_len += 1;
-        }
+        let run_len = zero_run_length_at(block, dct_comp);
 
         if run_len == 1 {
             ac.push(block[dct_comp]);
@@ -43,6 +40,41 @@ pub(super) fn rle_ac(block: &[u16; 64], ac: &mut Vec<u16>) {
 
         dct_comp += run_len;
     }
+}
+
+/// Consecutive zeros at `block[start..64]`. Caller requires `block[start] == 0`,
+/// so the result is always `>= 1`.
+///
+/// Wordwise (SWAR): packs four little-endian `u16`s into a `u64` and uses
+/// `trailing_zeros` for the first non-zero lane — same shape as
+/// `rle::run_length_at`'s byte scan, just 16-bit lanes against an implicit
+/// zero target (no broadcast/XOR needed).
+#[inline(always)]
+fn zero_run_length_at(block: &[u16; 64], start: usize) -> usize {
+    debug_assert!(start < 64);
+    debug_assert_eq!(block[start], 0);
+
+    let region = &block[start..64];
+    let mut count = 0usize;
+    let mut chunks = region.chunks_exact(4);
+    for chunk in &mut chunks {
+        let word = u64::from(chunk[0])
+            | (u64::from(chunk[1]) << 16)
+            | (u64::from(chunk[2]) << 32)
+            | (u64::from(chunk[3]) << 48);
+        if word == 0 {
+            count += 4;
+        } else {
+            return count + (word.trailing_zeros() / 16) as usize;
+        }
+    }
+    for &value in chunks.remainder() {
+        if value != 0 {
+            return count;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Un-RLE one 8x8 block of AC values into block[1..]
@@ -153,6 +185,41 @@ mod test {
         un_rle_ac(&mut stream, &mut decoded).unwrap();
 
         assert_eq!(decoded, block);
+    }
+
+    /// `zero_run_length_at` must match a naive byte-at-a-time zero scan for
+    /// every start index that is itself zero (the only call sites in `rle_ac`).
+    #[test]
+    fn zero_run_length_at_matches_naive_scan() {
+        fn naive(block: &[u16; 64], start: usize) -> usize {
+            let mut len = 1;
+            while start + len < 64 && block[start + len] == 0 {
+                len += 1;
+            }
+            len
+        }
+
+        let mut random = rand::rngs::StdRng::from_seed(SEED);
+        for _ in 0..512 {
+            let mut block = [0u16; 64];
+            for slot in block.iter_mut().skip(1) {
+                *slot = if random.random_bool(0.35) {
+                    0
+                } else {
+                    random.random_range(1..=0xfeff)
+                };
+            }
+            for start in 1..64 {
+                if block[start] != 0 {
+                    continue;
+                }
+                assert_eq!(
+                    zero_run_length_at(&block, start),
+                    naive(&block, start),
+                    "start={start}"
+                );
+            }
+        }
     }
 
     #[test]
