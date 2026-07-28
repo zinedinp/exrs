@@ -7,6 +7,7 @@
 //! Start with the `block::read(...)`
 //! and `block::write(...)` functions.
 
+pub mod pool;
 pub mod reader;
 pub mod writer;
 

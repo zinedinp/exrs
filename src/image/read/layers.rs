@@ -116,6 +116,38 @@ pub trait ChannelsReader {
 
     /// Deliver the final accumulated channel collection for the image
     fn into_channels(self) -> Self::Channels;
+
+    /// Whether `read_blocks_in_parallel` is supported by this reader. When
+    /// `true`, decompression *and* the pixel-storage conversion both run on
+    /// the decompression worker threads, instead of decompression alone,
+    /// avoiding the single-threaded bottleneck of calling `read_block` once
+    /// per block on the thread driving decompression. Default `false`:
+    /// falls back to the existing `read_block`per-completed-block loop.
+    /// Overridden by `SpecificChannelsReader` when its pixel storage
+    /// implements `RowMajorPixelStorage`.
+    #[cfg(feature = "rayon")]
+    fn supports_parallel_write(&self) -> bool {
+        false
+    }
+
+    /// Only called when `supports_parallel_write()` returns `true`. Reads
+    /// and decompresses every remaining chunk from `chunks` using `pool`,
+    /// writing each block's converted pixels directly from the worker that
+    /// decompressed it.
+    #[cfg(feature = "rayon")]
+    fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        header: &Header,
+        chunks: R,
+        meta_data: &MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        let _ = (header, chunks, meta_data, pool, pedantic);
+        unreachable!(
+            "read_blocks_in_parallel called without supports_parallel_write() == true"
+        )
+    }
 }
 
 impl<C> LayerReader<C> {
@@ -240,6 +272,29 @@ where
             "block should have been filtered out"
         );
         self.layer_reader.channels_reader.read_block(&headers[self.layer_index], block)
+    }
+
+    #[cfg(feature = "rayon")]
+    fn supports_parallel_write(&self) -> bool {
+        self.layer_reader.channels_reader.supports_parallel_write()
+    }
+
+    #[cfg(feature = "rayon")]
+    fn read_blocks_in_parallel<R: crate::block::reader::ChunksReader + Send>(
+        &mut self,
+        headers: &[Header],
+        chunks: R,
+        meta_data: &MetaData,
+        pool: &rayon_core::ThreadPool,
+        pedantic: bool,
+    ) -> UnitResult {
+        self.layer_reader.channels_reader.read_blocks_in_parallel(
+            &headers[self.layer_index],
+            chunks,
+            meta_data,
+            pool,
+            pedantic,
+        )
     }
 
     fn into_layers(self) -> Self::Layers {

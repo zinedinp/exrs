@@ -61,7 +61,11 @@ pub mod prelude {
             },
             write::{channels::GetPixel, WritableImage},
         };
+
+        pub use crate::image::read::specific_channels::RowMajorPixelStorage;
     }
+
+    pub use crate::image::read::specific_channels::FlatRowMajorPixelStorage;
 
     // re-export external stuff
     pub use half::f16;

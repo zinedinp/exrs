@@ -271,7 +271,7 @@ fn cpy_u8(src: &[u16], src_i: usize, dst: &mut [u8], dst_i: usize, n: usize) {
 
 pub fn decompress(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize,
     _pedantic: bool,
@@ -582,7 +582,8 @@ pub fn compress(
 
     // Generate a whole buffer that we will crop to proper size once compression is
     // done.
-    let mut b44_compressed = vec![0; std::cmp::max(2048, uncompressed_le.len())];
+    let mut b44_compressed =
+        crate::block::pool::take_zeroed(std::cmp::max(2048, uncompressed_le.len()));
     let mut b44_end = 0; // Buffer byte index for storing next compressed values.
 
     for channel in &channel_data {
@@ -742,7 +743,7 @@ mod test {
         let compressed = b44::compress(&channels, pixel_bytes.clone(), rectangle, true).unwrap();
 
         let decompressed =
-            b44::decompress(&channels, compressed.clone(), rectangle, pixel_bytes.len(), true)
+            b44::decompress(&channels, &compressed, rectangle, pixel_bytes.len(), true)
                 .unwrap();
 
         assert_eq!(decompressed.len(), pixel_bytes.len());

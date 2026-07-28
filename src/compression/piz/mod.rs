@@ -2,13 +2,12 @@
 //! based on the PIZ image format, customized for `OpenEXR`.
 // inspired by  https://github.com/AcademySoftwareFoundation/openexr/blob/master/OpenEXR/IlmImf/ImfPizCompressor.cpp
 
-mod huffman;
 mod wavelet;
 
 use std::convert::TryFrom;
 
 use crate::{
-    compression::{mod_p, ByteVec, Bytes},
+    compression::{huffman, mod_p, ByteVec, Bytes},
     error::{usize_to_i32, usize_to_u16},
     io::Data,
     meta::attribute::*,
@@ -30,7 +29,7 @@ struct ChannelData {
 
 pub fn decompress(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: &[u8],
     rectangle: IntegerBounds,
     expected_byte_size: usize, /* TODO remove expected byte size as it can be computed with
                                 * `rectangle.size.area() * channels.bytes_per_pixel` */
@@ -48,7 +47,7 @@ pub fn decompress(
 
     let mut bitmap = vec![0_u8; BITMAP_SIZE]; // FIXME use bit_vec!
 
-    let mut remaining_input_le = compressed_le.as_slice();
+    let mut remaining_input_le = compressed_le;
     let min_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
     let max_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
 
@@ -223,7 +222,7 @@ pub fn compress(
     let (max_value, table) = forward_lookup_table_from_bitmap(&bitmap);
     apply_lookup_table(&mut tmp, &table);
 
-    let mut piz_compressed = Vec::with_capacity(uncompressed_le.len() / 2);
+    let mut piz_compressed = crate::block::pool::take_with_capacity(uncompressed_le.len() / 2);
     u16::try_from(min_non_zero)?.write_le(&mut piz_compressed)?;
     u16::try_from(max_non_zero)?.write_le(&mut piz_compressed)?;
 
@@ -328,7 +327,7 @@ mod test {
 
         let compressed = piz::compress(&channels, pixel_bytes.clone(), rectangle).unwrap();
         let decompressed =
-            piz::decompress(&channels, compressed, rectangle, pixel_bytes.len(), true).unwrap();
+            piz::decompress(&channels, &compressed, rectangle, pixel_bytes.len(), true).unwrap();
 
         assert_eq!(pixel_bytes, decompressed);
     }
