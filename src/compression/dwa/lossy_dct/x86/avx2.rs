@@ -222,7 +222,7 @@ pub(super) fn write_row_f16(
     let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
     let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
     let linear = match to_linear {
-        Some(table) => linearize_lanes(v3, nonlinear, table),
+        Some(table) => linearize_lanes(v3.sse2, nonlinear, table),
         None => nonlinear,
     };
     let bytes: [u8; 16] = pulp::cast!(linear);
@@ -250,7 +250,7 @@ pub(super) fn write_row_f32(
     let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
     let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
     let linear = match to_linear {
-        Some(table) => linearize_lanes(v3, nonlinear, table),
+        Some(table) => linearize_lanes(v3.sse2, nonlinear, table),
         None => nonlinear,
     };
     let widened = f16c._mm256_cvtph_ps(linear);
@@ -264,13 +264,15 @@ pub(super) fn write_row_f32(
 // output to nonlinear half bits (matching `half::f16::from_f32`'s own F16C
 // path bit-for-bit), each lane is extracted to a GPR to index `to_linear`
 // (an AVX-512F 16-lane row does the same thing twice -- see `avx512.rs`).
+//
+// Takes the raw `Sse2` capability, not a whole tier struct: this function
+// only ever touches `.sse2`, and the true-SSE2-only `sse2.rs` write-row
+// (no F16C, no AVX2) needs to call it too.
 pub(super) fn linearize_lanes(
-    v3: V3,
+    sse2: pulp::core_arch::x86::Sse2,
     bits: std::arch::x86_64::__m128i,
     to_linear: &[u16; 65536],
 ) -> std::arch::x86_64::__m128i {
-    let sse2 = v3.sse2;
-
     let i0 = sse2._mm_extract_epi16::<0>(bits);
     let i1 = sse2._mm_extract_epi16::<1>(bits);
     let i2 = sse2._mm_extract_epi16::<2>(bits);

@@ -12,9 +12,10 @@
 
 mod avx2;
 mod avx512;
+mod sse2;
 
 use crate::{
-    compression::simd_tier::x86::{f16c as tier_f16c, v3 as tier_v3, v4 as tier_v4},
+    compression::simd_tier::x86::{f16c as tier_f16c, v1 as tier_v1, v3 as tier_v3, v4 as tier_v4},
     error::Result as ExrResult,
 };
 
@@ -59,6 +60,30 @@ pub(super) fn try_write_row_f32(
         return false;
     };
     avx2::write_row_f32(v3, f16c, row, to_linear, out_row)
+}
+
+/// SSE2-only fallback for `try_write_row_f16`/`try_write_row_f32`
+pub(super) fn try_write_row_f16_sse2(
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let Some(v1) = tier_v1() else {
+        return false;
+    };
+    sse2::write_row_f16(v1, row, to_linear, out_row)
+}
+
+/// SSE2-only fallback for `try_write_row_f32`, see `try_write_row_f16_sse2`.
+pub(super) fn try_write_row_f32_sse2(
+    row: &[f32],
+    to_linear: Option<&[u16; 65536]>,
+    out_row: &mut [u8],
+) -> bool {
+    let Some(v1) = tier_v1() else {
+        return false;
+    };
+    sse2::write_row_f32(v1, row, to_linear, out_row)
 }
 
 /// For each spatial 8x8, finish unRLE -> zigzag -> iDCT -> CSC -> scanline

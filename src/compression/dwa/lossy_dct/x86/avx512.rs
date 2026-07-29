@@ -373,8 +373,8 @@ fn write_row16_f16(
             let v3: V3 = *v4;
             let lo = v4.avx._mm256_castsi256_si128(nonlinear);
             let hi = v4.avx2._mm256_extracti128_si256::<1>(nonlinear);
-            let lo_lin = linearize_lanes(v3, lo, table);
-            let hi_lin = linearize_lanes(v3, hi, table);
+            let lo_lin = linearize_lanes(v3.sse2, lo, table);
+            let hi_lin = linearize_lanes(v3.sse2, hi, table);
             v4.avx2
                 ._mm256_inserti128_si256::<1>(v4.avx._mm256_castsi128_si256(lo_lin), hi_lin)
         }
@@ -419,8 +419,8 @@ fn write_row16_f32(
             let v3: V3 = *v4;
             let lo = v4.avx._mm256_castsi256_si128(nonlinear);
             let hi = v4.avx2._mm256_extracti128_si256::<1>(nonlinear);
-            let lo_lin = linearize_lanes(v3, lo, table);
-            let hi_lin = linearize_lanes(v3, hi, table);
+            let lo_lin = linearize_lanes(v3.sse2, lo, table);
+            let hi_lin = linearize_lanes(v3.sse2, hi, table);
             v4.avx2
                 ._mm256_inserti128_si256::<1>(v4.avx._mm256_castsi128_si256(lo_lin), hi_lin)
         }

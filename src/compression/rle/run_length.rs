@@ -4,10 +4,7 @@
 //! once via XOR + `trailing_zeros`, instead of one byte per iteration. Real
 //! content is a mix of short literal runs and long flat runs (constant-color
 //! regions: mattes, alpha, skies), where cutting iterations up to 8x is a
-//! real, measured win (~19-20% faster real-file RLE writes). See
-//! `rle_encode_experiment` for the isolated A/B this was benchmark-gated on
-//! before shipping, and the Obsidian vault note `ZIP-RLE-Codec.md` for a full
-//! bit-level / generated-assembly walkthrough.
+//! real, measured win (~19-20% faster real-file RLE writes).
 
 use std::convert::TryInto;
 

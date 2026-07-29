@@ -24,6 +24,12 @@ mod transfer_curve;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
+// Prototype sketch only -- NOT called from `decode_lossy_dct_group` below,
+// unverified (no ARM hardware/emulator on this dev machine), not ready to
+// ship. See `aarch64::neon`'s module docs.
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+
 use ac_rle::{rle_ac, un_rle_ac};
 use quantization::{from_half_zigzag, quantize_coefficients_to_zigzag, QuantTables};
 use transfer_curve::{to_linear_table, to_nonlinear_table};
@@ -501,9 +507,15 @@ fn decode_lossy_dct_group(
                                         let handled = match target.sample_type {
                                             SampleType::F16 => {
                                                 x86::try_write_row_f16(row, to_linear, out_row)
+                                                    || x86::try_write_row_f16_sse2(
+                                                        row, to_linear, out_row,
+                                                    )
                                             }
                                             SampleType::F32 => {
                                                 x86::try_write_row_f32(row, to_linear, out_row)
+                                                    || x86::try_write_row_f32_sse2(
+                                                        row, to_linear, out_row,
+                                                    )
                                             }
                                             SampleType::U32 => false,
                                         };
