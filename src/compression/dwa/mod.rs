@@ -50,8 +50,8 @@ use channel_rules::{
 use chunk_header::{AcCompression, DwaHeader};
 use lossy_dct::{decode_lossy_channels, encode_lossy_channels};
 use section_stream::{
-    decode_ac_section_into, decode_dc_section, decode_rle_section_into, decode_unknown_section,
-    split_sections, zip_deconstruct_bytes,
+    decode_ac_section_into, decode_dc_section, decode_rle_section_into,
+    decode_unknown_section_into, split_sections, zip_deconstruct_bytes,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,9 +290,20 @@ pub fn decompress(
 
     let [unknown_section, ac_section, dc_section, rle_section] = split_sections(input, &header)?;
 
+    // Reused across every chunk this thread decodes, same reasoning as
+    // `RLE_BUFFER` below: the UNKNOWN section's zlib output has no further
+    // expansion step, so it -- not some later stage -- is the large,
+    // page-fault-prone buffer worth keeping alive between chunks.
+    thread_local! {
+        static UNKNOWN_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[cfg(feature = "dwa-profile")]
     let t = profile::start();
-    let unknown_planar = decode_unknown_section(unknown_section, &header)?;
+    let mut unknown_buffer =
+        UNKNOWN_BUFFER.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    let unknown_len = decode_unknown_section_into(unknown_section, &header, &mut unknown_buffer)?;
+    let unknown_planar = &unknown_buffer[..unknown_len];
     #[cfg(feature = "dwa-profile")]
     t.stop(&profile::UNKNOWN_NS);
 
@@ -381,7 +392,7 @@ pub fn decompress(
         &channel_infos,
         rectangle,
         &row_offsets,
-        &unknown_planar,
+        unknown_planar,
         rle_planar,
         &mut out,
     )?;
@@ -389,6 +400,7 @@ pub fn decompress(
     t.stop(&profile::ASSEMBLE_NS);
 
     RLE_BUFFER.with(|buffer| *buffer.borrow_mut() = rle_buffer);
+    UNKNOWN_BUFFER.with(|buffer| *buffer.borrow_mut() = unknown_buffer);
 
     #[cfg(feature = "dwa-profile")]
     total.stop(&profile::TOTAL_NS);
