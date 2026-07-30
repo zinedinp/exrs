@@ -41,13 +41,41 @@ fn inflate(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     Ok(inflated)
 }
 
+/// Same contract as `inflate`, but writes into a caller-reused buffer
+/// instead of returning a fresh `Vec`.
+/// Currently just the UNKNOWN section. 
+fn inflate_into(compressed: &[u8], expected_size: usize, buffer: &mut Vec<u8>) -> Result<()> {
+    if buffer.len() < expected_size {
+        buffer.resize(expected_size, 0);
+    }
+
+    let mut decompress = flate2::Decompress::new(true);
+    let status = decompress
+        .decompress(compressed, &mut buffer[..expected_size], flate2::FlushDecompress::Finish)
+        .map_err(|_| Error::invalid("DWA zlib data malformed"))?;
+
+    if status != flate2::Status::StreamEnd
+        || usize::try_from(decompress.total_out()) != Ok(expected_size)
+    {
+        return Err(Error::invalid("DWA zlib data size mismatch"));
+    }
+    Ok(())
+}
+
 /// UNKNOWN section: raw (non-DCT-compressible) channel data,
 /// zlib-compressed, planar in channel order.
-pub(super) fn decode_unknown_section(section: &[u8], header: &DwaHeader) -> Result<Vec<u8>> {
+/// Expands into `buffer`, reusing whatever capacity it already has (same
+/// reasoning as `decode_rle_section_into`'s buffer)
+pub(super) fn decode_unknown_section_into(
+    section: &[u8],
+    header: &DwaHeader,
+    buffer: &mut Vec<u8>,
+) -> Result<usize> {
     if header.unknown_uncompressed_size == 0 {
-        return Ok(vec![]);
+        return Ok(0);
     }
-    inflate(section, header.unknown_uncompressed_size)
+    inflate_into(section, header.unknown_uncompressed_size, buffer)?;
+    Ok(header.unknown_uncompressed_size)
 }
 
 /// AC section: RLE DCT coefficients as u16, entropy coded with either the

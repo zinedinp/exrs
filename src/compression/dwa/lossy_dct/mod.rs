@@ -16,6 +16,7 @@ use crate::{
     meta::attribute::SampleType,
 };
 
+mod ac_rle;
 mod half_float_quantizer;
 mod quantization;
 mod transfer_curve;
@@ -23,9 +24,19 @@ mod transfer_curve;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
-use quantization::{
-    from_half_zigzag, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
-};
+// Write-row NEON acceleration; the DCT/CSC stages already dispatch to NEON
+// generically (see `discrete_cosine_transform`/`color_space_conversion`).
+// Cross-compile-checked and unit-tested only -- no ARM hardware/emulator on
+// this dev machine. See `aarch64::neon`'s module docs.
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+
+// Same as `aarch64` above, for 32-bit ARM (needs nightly + `arm-neon`).
+#[cfg(target_arch = "arm")]
+mod aarch32;
+
+use ac_rle::{rle_ac, un_rle_ac};
+use quantization::{from_half_zigzag, quantize_coefficients_to_zigzag, QuantTables};
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
 pub(super) fn encode_lossy_channels(
@@ -501,9 +512,45 @@ fn decode_lossy_dct_group(
                                         let handled = match target.sample_type {
                                             SampleType::F16 => {
                                                 x86::try_write_row_f16(row, to_linear, out_row)
+                                                    || x86::try_write_row_f16_sse2(
+                                                        row, to_linear, out_row,
+                                                    )
                                             }
                                             SampleType::F32 => {
                                                 x86::try_write_row_f32(row, to_linear, out_row)
+                                                    || x86::try_write_row_f32_sse2(
+                                                        row, to_linear, out_row,
+                                                    )
+                                            }
+                                            SampleType::U32 => false,
+                                        };
+                                        if handled {
+                                            continue;
+                                        }
+                                    }
+                                    #[cfg(target_arch = "aarch64")]
+                                    {
+                                        let handled = match target.sample_type {
+                                            SampleType::F16 => {
+                                                aarch64::try_write_row_f16(row, to_linear, out_row)
+                                            }
+                                            SampleType::F32 => {
+                                                aarch64::try_write_row_f32(row, to_linear, out_row)
+                                            }
+                                            SampleType::U32 => false,
+                                        };
+                                        if handled {
+                                            continue;
+                                        }
+                                    }
+                                    #[cfg(target_arch = "arm")]
+                                    {
+                                        let handled = match target.sample_type {
+                                            SampleType::F16 => {
+                                                aarch32::try_write_row_f16(row, to_linear, out_row)
+                                            }
+                                            SampleType::F32 => {
+                                                aarch32::try_write_row_f32(row, to_linear, out_row)
                                             }
                                             SampleType::U32 => false,
                                         };

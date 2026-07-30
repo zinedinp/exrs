@@ -8,7 +8,7 @@ use std::arch::x86_64::__m256;
 
 use pulp::{cast, f32x8, x86::V3};
 
-use super::forward_basis;
+use super::super::forward_basis;
 
 // Transposes 8 contiguous row-vectors into 8 column-vectors entirely in
 // registers (unpacklo/unpackhi + shuffle + permute2f128), replacing a scalar

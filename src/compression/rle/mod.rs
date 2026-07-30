@@ -1,5 +1,8 @@
 use super::{optimize_bytes::*, Error, Result, *};
 
+mod run_length;
+pub(super) use run_length::run_length_at;
+
 // inspired by  https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfRle.cpp
 
 const MIN_RUN_LENGTH: usize = 3;
@@ -110,15 +113,9 @@ pub fn compress_bytes(
 pub(super) fn pack_rle_tokens(data_le: &[u8]) -> ByteVec {
     let mut compressed_le = crate::block::pool::take_with_capacity(data_le.len());
     let mut run_start = 0;
-    let mut run_end = 1;
 
     while run_start < data_le.len() {
-        while run_end < data_le.len()
-            && data_le[run_start] == data_le[run_end]
-            && ((run_end - run_start) as i32) - 1 < (MAX_RUN_LENGTH as i32)
-        {
-            run_end += 1;
-        }
+        let mut run_end = run_start + run_length_at(data_le, run_start);
 
         if run_end - run_start >= MIN_RUN_LENGTH {
             compressed_le.push((((run_end - run_start) as i32) - 1) as u8);
@@ -139,7 +136,6 @@ pub(super) fn pack_rle_tokens(data_le: &[u8]) -> ByteVec {
             compressed_le.extend_from_slice(&data_le[run_start..run_end]);
 
             run_start = run_end;
-            run_end += 1;
         }
     }
 
@@ -163,5 +159,57 @@ fn take_n<'s>(slice: &mut &'s [u8], n: usize) -> Result<&'s [u8]> {
         Ok(front)
     } else {
         Err(Error::invalid("compressed data"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn assert_roundtrips(data: &[u8]) {
+        let packed = pack_rle_tokens(data);
+        let unpacked = unpack_rle_tokens(&packed, data.len(), true).unwrap();
+        assert_eq!(data, &unpacked[..], "roundtrip failed for {} bytes", data.len());
+    }
+
+    /// Exercises the exact boundary the widened `run_length_at` has to get
+    /// right: OpenEXR's repeat token caps a run at 128 bytes even though
+    /// `MAX_RUN_LENGTH` is 127 (see `run_length_at`'s doc comment) > lengths
+    /// just below/at/above that boundary are where an off-by-one would hide.
+    #[test]
+    fn run_length_boundary_lengths_roundtrip() {
+        for &len in &[1usize, 2, 3, 4, 63, 64, 65, 126, 127, 128, 129, 130, 255, 256, 257, 1000] {
+            assert_roundtrips(&vec![7u8; len]);
+        }
+    }
+
+    #[test]
+    fn empty_roundtrips() {
+        assert_roundtrips(&[]);
+    }
+
+    #[test]
+    fn no_repeats_roundtrips() {
+        let data: Vec<u8> = (0..500).map(|i| (i * 37) as u8).collect();
+        assert_roundtrips(&data);
+    }
+
+    #[test]
+    fn mixed_runs_and_literals_roundtrips() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        for _ in 0..200 {
+            let mut data = Vec::new();
+            while data.len() < 4000 {
+                if rng.random_range(0.0..1.0) < 0.3 {
+                    let run_len = rng.random_range(1..=140);
+                    let value = rng.random::<u8>();
+                    data.extend(std::iter::repeat(value).take(run_len));
+                } else {
+                    data.push(rng.random::<u8>());
+                }
+            }
+            assert_roundtrips(&data);
+        }
     }
 }

@@ -1,18 +1,9 @@
 //! Portable 16-byte OpenEXR log-depth `reconstruct`.
 //!
 //! Same algorithm as x86 SSE (`_mm_slli_si128` + `paddb`) and aarch64 NEON
-//! (`vextq_u8` + `vaddq_u8`): Hillis–Steele inclusive prefix sum inside each
-//! 16-byte chunk, then broadcast carry into the next chunk.
+//! (`vextq_u8` + `vaddq_u8`)
 //!
-//! Used as the **default 32-bit ARM production path** on stable (no unstable
-//! stdarch). With exrs feature `arm-neon` + nightly, production prefers real
-//! NEON via the local pulp fork (`pulp::arm::Neon` — see `arm/neon.rs`); this
-//! portable tree remains the fallback when Neon is unavailable.
-//!
-//! **Not tested on real 32-bit ARM hardware in this tree.** Correctness is
-//! unit-tested on the host (bit-exact vs scalar). Expect a win on superscalar
-//! cores; on tiny in-order cores without NEON the pair-ILP scalar may be
-//! similar — real Arm A/B still open.
+//! **Not tested on real 32-bit ARM hardware
 
 use std::convert::TryInto;
 
