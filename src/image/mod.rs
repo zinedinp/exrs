@@ -663,7 +663,7 @@ impl<LevelSamples> Levels<LevelSamples> {
     // TODO storage order for RIP maps?
     pub fn get_level_mut(&mut self, level: Vec2<usize>) -> Result<&mut LevelSamples> {
         match self {
-            Self::Singular(ref mut block) => {
+            Self::Singular(block) => {
                 debug_assert_eq!(
                     level,
                     Vec2(0, 0),
