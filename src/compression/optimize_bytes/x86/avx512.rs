@@ -51,6 +51,12 @@ fn run_lane(v4: V4, buffer: &mut [u8], tail: Tail) {
         return;
     }
 
+    if buffer.len() < 64 {
+        let v3: V3 = *v4;
+        avx2::differences_to_samples_lane_sse_tail(v3, buffer);
+        return;
+    }
+
     let bw = v4.avx512bw;
     let f = v4.avx512f;
     let ssse3 = v4.ssse3;

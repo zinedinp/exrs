@@ -6,13 +6,13 @@
 //!
 //! Used as the **default 32-bit ARM production path** on stable (no unstable
 //! stdarch). With exrs feature `arm-neon` + nightly, production prefers real
-//! NEON via the local pulp fork (`pulp::arm::Neon` — see `arm/neon.rs`); this
+//! NEON via the local pulp fork (`pulp::arm::Neon` —> see `arm/neon.rs`); this
 //! portable tree remains the fallback when Neon is unavailable.
 //!
 //! **Not tested on real 32-bit ARM hardware in this tree.** Correctness is
 //! unit-tested on the host (bit-exact vs scalar). Expect a win on superscalar
 //! cores; on tiny in-order cores without NEON the pair-ILP scalar may be
-//! similar — real Arm A/B still open.
+//! similar
 
 use std::convert::TryInto;
 
