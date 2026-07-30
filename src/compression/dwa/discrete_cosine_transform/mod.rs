@@ -19,6 +19,14 @@
 #[doc(hidden)]
 pub mod x86;
 
+#[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
+pub mod aarch64;
+
+#[cfg(target_arch = "arm")]
+#[doc(hidden)]
+pub mod aarch32;
+
 // public only for benchmarking (benches/dct.rs reaches
 // `test::pseudo_random_blocks`)
 #[cfg(any(test, feature = "simd-benches"))]
@@ -177,6 +185,14 @@ pub(crate) fn dct_forward_8x8_batch<'a>(mut blocks: impl Iterator<Item = &'a mut
     if x86::try_dct_forward_8x8_batch(&mut blocks) {
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if aarch64::try_dct_forward_8x8_batch(&mut blocks) {
+        return;
+    }
+    #[cfg(target_arch = "arm")]
+    if aarch32::try_dct_forward_8x8_batch(&mut blocks) {
+        return;
+    }
 
     for data in blocks {
         dct_forward_8x8_autovectorized(data);
@@ -191,10 +207,48 @@ pub(crate) fn dct_inverse_8x8_batch<'a>(mut blocks: impl Iterator<Item = &'a mut
     if x86::try_dct_inverse_8x8_batch(&mut blocks) {
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if aarch64::try_dct_inverse_8x8_batch(&mut blocks) {
+        return;
+    }
+    #[cfg(target_arch = "arm")]
+    if aarch32::try_dct_inverse_8x8_batch(&mut blocks) {
+        return;
+    }
 
     for data in blocks {
         dct_inverse_8x8_autovectorized(data);
     }
+}
+
+/// Forward-DCT basis table (cosine coefficients), shared by every SIMD tier
+/// across every architecture -- purely data, no architecture-specific shape.
+/// Unused (dead) on 32-bit ARM builds without the `arm-neon` feature, where
+/// no SIMD tier is available at all.
+#[allow(dead_code)]
+pub(crate) fn forward_basis() -> &'static [[f32; 8]; 8] {
+    use std::sync::OnceLock;
+
+    static TABLE: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
+
+    TABLE.get_or_init(|| {
+        const PI: f32 = 3.14159;
+        const INV_SQRT_2: f32 = 0.70710677;
+
+        let mut table = [[0.0f32; 8]; 8];
+        for input in 0..8 {
+            for output in 0..8 {
+                let scale = if output == 0 {
+                    0.5 * INV_SQRT_2
+                } else {
+                    0.5
+                };
+                table[input][output] =
+                    scale * (((2 * input + 1) as f32 * output as f32 * PI) / 16.0).cos();
+            }
+        }
+        table
+    })
 }
 
 /// Optimized path when only DC is non-zero.

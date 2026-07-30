@@ -1,18 +1,18 @@
-//! NEON analog of `x86::sse2::write_row_f16`/`write_row_f32`: convert an
-//! 8-wide row of DCT output (`f32`) to nonlinear half bits, run it through
-//! the optional `to_linear` table, and pack the result into an output row of
-//! bytes (`write_row_f16`) or widen it back to `f32` first (`write_row_f32`).
-//!
-//! ## Why NEON needs more work than SSE2/AVX2 here
-//!
-//! x86's F16C extension gives `write_row_f16` a single hardware instruction
-//! (`vcvtps2ph`) for the f32->f16 conversion. AArch64 NEON's hardware FP16
-//! conversion (`FCVTN`/`vcvt_f16_f32`) is not currently wrapped by the
-//! pulp fork (`pulp::aarch64::Neon` has no `f16` conversion method).
+//! 32-bit ARM NEON analog of `x86::sse2::write_row_f16`/`write_row_f32` (and
+//! 1:1 port of `aarch64::neon`'s version of the same): convert an 8-wide row
+//! of DCT output (`f32`) to nonlinear half bits, run it through the optional
+//! `to_linear` table, and pack the result into an output row of bytes
+//! (`write_row_f16`) or widen it back to `f32` first (`write_row_f32`).
+
 use std::convert::TryInto;
 
-use core::arch::aarch64::{float32x4_t, uint16x4_t, uint16x8_t, uint32x4_t};
-use pulp::aarch64::Neon;
+use core::arch::arm::{float32x4_t, uint16x4_t, uint16x8_t, uint32x4_t};
+use pulp::aarch32::Neon;
+
+// `core::arch::arm`'s NEON vector types don't implement bytemuck `Pod`
+// (unlike their aarch64 equivalents, which `pulp::cast!` handles directly),
+// so the plain-array boundary conversions need `transmute` -> `#![forbid(unsafe_code)]`.
+// `Neon::u32x4_from_bits` in pulp
 
 /// Lane-wise, branchless, round-to-nearest-even f32->f16 bit conversion.
 /// Ported onto 4 NEON lanes at once.
@@ -38,8 +38,7 @@ fn f32_bits_to_f16_bits_x4(simd: Neon, x_in: uint32x4_t) -> uint16x4_t {
         neon.vbslq_u32(is_nan, neon.vdupq_n_u32(0x7e00), neon.vdupq_n_u32(0x7c00));
 
     // Denormal/zero path: add a magic float so IEEE round-to-nearest-even
-    // addition does the mantissa rounding for us, then subtract the magic
-    // bits back off.
+    // addition does the mantissa rounding for us.
     let denorm_magic_bits = neon.vdupq_n_u32(DENORM_MAGIC_BITS);
     let x_f: float32x4_t = neon.vreinterpretq_f32_u32(x);
     let magic_f: float32x4_t = neon.vreinterpretq_f32_u32(denorm_magic_bits);
@@ -64,8 +63,7 @@ fn f32_bits_to_f16_bits_x4(simd: Neon, x_in: uint32x4_t) -> uint16x4_t {
 }
 
 /// Lane-wise f16->f32 bit widening for 4 lanes, each already zero-extended
-/// into a `uint32x4_t` lane (see call sites: `vmovl_u16` against one half of
-/// a `uint16x8_t`). Mirrors `x86::sse2::f16_bits_to_f32_bits_x4`.
+/// into a `uint32x4_t` lane
 #[inline]
 fn f16_bits_to_f32_bits_x4(simd: Neon, h_in: uint32x4_t) -> uint32x4_t {
     let neon = simd.neon;
@@ -88,7 +86,6 @@ fn f16_bits_to_f32_bits_x4(simd: Neon, h_in: uint32x4_t) -> uint32x4_t {
 
 /// NEON analog of `x86::avx2::write_row_f16`. `row` must be exactly 8 `f32`
 /// DCT-output samples; `out_row` exactly 16 bytes (8 half-float samples).
-/// Returns `false` (caller falls back to scalar) on any shape mismatch.
 #[inline]
 pub fn write_row_f16(
     simd: Neon,
@@ -107,8 +104,8 @@ pub fn write_row_f16(
 
     let lo_bits: [u32; 4] = std::array::from_fn(|i| row[i].to_bits());
     let hi_bits: [u32; 4] = std::array::from_fn(|i| row[4 + i].to_bits());
-    let lo: uint32x4_t = pulp::cast!(lo_bits);
-    let hi: uint32x4_t = pulp::cast!(hi_bits);
+    let lo: uint32x4_t = simd.u32x4_from_bits(lo_bits);
+    let hi: uint32x4_t = simd.u32x4_from_bits(hi_bits);
 
     let lo_half = f32_bits_to_f16_bits_x4(simd, lo);
     let hi_half = f32_bits_to_f16_bits_x4(simd, hi);
@@ -132,7 +129,7 @@ pub fn write_row_f16(
         None => nonlinear,
     };
 
-    let bytes: [u8; 16] = pulp::cast!(linear);
+    let bytes: [u8; 16] = simd.u16x8_to_bytes(linear);
     out_row.copy_from_slice(&bytes);
     true
 }
@@ -157,8 +154,8 @@ pub fn write_row_f32(
 
     let lo_bits: [u32; 4] = std::array::from_fn(|i| row[i].to_bits());
     let hi_bits: [u32; 4] = std::array::from_fn(|i| row[4 + i].to_bits());
-    let lo: uint32x4_t = pulp::cast!(lo_bits);
-    let hi: uint32x4_t = pulp::cast!(hi_bits);
+    let lo: uint32x4_t = simd.u32x4_from_bits(lo_bits);
+    let hi: uint32x4_t = simd.u32x4_from_bits(hi_bits);
 
     let lo_half = f32_bits_to_f16_bits_x4(simd, lo);
     let hi_half = f32_bits_to_f16_bits_x4(simd, hi);
@@ -189,16 +186,15 @@ pub fn write_row_f32(
     let widened_lo = f16_bits_to_f32_bits_x4(simd, linear_lo32);
     let widened_hi = f16_bits_to_f32_bits_x4(simd, linear_hi32);
 
-    let bytes_lo: [u8; 16] = pulp::cast!(widened_lo);
-    let bytes_hi: [u8; 16] = pulp::cast!(widened_hi);
+    let bytes_lo: [u8; 16] = simd.u32x4_to_bytes(widened_lo);
+    let bytes_hi: [u8; 16] = simd.u32x4_to_bytes(widened_hi);
     out_row[..16].copy_from_slice(&bytes_lo);
     out_row[16..].copy_from_slice(&bytes_hi);
     true
 }
 
-/// Bit-exactness check against `half::f16::from_f32`. Only compiles for
-/// `target_arch = "aarch64"`
-#[cfg(all(test, target_arch = "aarch64"))]
+/// Bit-exactness check against `half::f16::from_f32`.
+#[cfg(all(test, target_arch = "arm", feature = "arm-neon"))]
 mod test {
     use super::*;
     use half::f16;
@@ -249,8 +245,8 @@ mod test {
     }
 
     /// `write_row_f32` must round-trip through half precision the same way
-    /// `write_row_f16` does, then widen back to `f32` -- i.e. match
-    /// `f16::from_f32(value).to_f32()` bit-for-bit (NaN payload excepted).
+    /// `write_row_f16` does, then widen back to `f32`. i.e. match
+    /// `f16::from_f32(value).to_f32()` bit-for-bit.
     #[test]
     fn write_row_f32_matches_scalar_no_table() {
         let simd = Neon::try_new().expect("NEON requested but unavailable");

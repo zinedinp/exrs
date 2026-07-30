@@ -1,8 +1,8 @@
-// SSE2 V1 tier: OpenEXRs "dctInverse8x8_sse2". Vectorizes 4
-// output positions of one row at a time a different shape than "avx2",
-// so the two are not bit-identical.
+// aarch64 NEON: 1:1 port of `x86::sse2`'s "dctInverse8x8_sse2" shape
+// row-pass then two 4-lane column-pass halves using pulp's portable
+// `f32x4` lane API (`mul_f32x4`/`add_f32x4`/`sub_f32x4`/`splat_f32x4`)
 
-use pulp::{f32x4, x86::V1};
+use pulp::{aarch64::Neon, f32x4};
 
 use super::super::forward_basis;
 
@@ -52,26 +52,26 @@ struct ColumnCoefficients {
 }
 
 impl ColumnCoefficients {
-    fn new(v1: V1) -> Self {
+    fn new(neon: Neon) -> Self {
         Self {
-            a: v1.splat_f32x4(A),
-            b: v1.splat_f32x4(B),
-            c: v1.splat_f32x4(C),
-            d: v1.splat_f32x4(D),
-            e: v1.splat_f32x4(E),
-            f: v1.splat_f32x4(F),
-            g: v1.splat_f32x4(G),
+            a: neon.splat_f32x4(A),
+            b: neon.splat_f32x4(B),
+            c: neon.splat_f32x4(C),
+            d: neon.splat_f32x4(D),
+            e: neon.splat_f32x4(E),
+            f: neon.splat_f32x4(F),
+            g: neon.splat_f32x4(G),
         }
     }
 }
 
 // One row, summed strictly left-to-right from an explicit zero register,
-// matching "DCT_INVERSE_8x8_SS2_ROW_LOOP"s "_mm_add_ps" exactly.
-fn row_pass(v1: V1, coef: &RowCoefficients, row: &[f32]) -> (f32x4, f32x4) {
-    let mul = |a, b| v1.mul_f32x4(a, b);
-    let add = |a, b| v1.add_f32x4(a, b);
-    let sub = |a, b| v1.sub_f32x4(a, b);
-    let broadcast = |v: f32| v1.splat_f32x4(v);
+// matching the SSE2 tier (and OpenEXR's "DCT_INVERSE_8x8_SS2_ROW_LOOP")
+fn row_pass(neon: Neon, coef: &RowCoefficients, row: &[f32]) -> (f32x4, f32x4) {
+    let mul = |a, b| neon.mul_f32x4(a, b);
+    let add = |a, b| neon.add_f32x4(a, b);
+    let sub = |a, b| neon.sub_f32x4(a, b);
+    let broadcast = |v: f32| neon.splat_f32x4(v);
 
     let x0 = mul(broadcast(row[0]), coef.c0);
     let x2 = mul(broadcast(row[2]), coef.c1);
@@ -83,7 +83,7 @@ fn row_pass(v1: V1, coef: &RowCoefficients, row: &[f32]) -> (f32x4, f32x4) {
     let x5 = mul(broadcast(row[5]), coef.c6);
     let x7 = mul(broadcast(row[7]), coef.c7);
 
-    let zero = v1.splat_f32x4(0.0);
+    let zero = neon.splat_f32x4(0.0);
     let even = add(add(add(add(zero, x0), x2), x4), x6);
     let odd = add(add(add(add(zero, x1), x3), x5), x7);
 
@@ -93,11 +93,11 @@ fn row_pass(v1: V1, coef: &RowCoefficients, row: &[f32]) -> (f32x4, f32x4) {
 }
 
 // Same alpha/theta/gamma structure as the scalar kernel, but with
-// beta0..beta3 tree-paired, matching "dctInverse8x8_sse2" exactly.
-fn column_pass(v1: V1, coef: &ColumnCoefficients, input: [f32x4; 8]) -> [f32x4; 8] {
-    let mul = |a, b| v1.mul_f32x4(a, b);
-    let add = |a, b| v1.add_f32x4(a, b);
-    let sub = |a, b| v1.sub_f32x4(a, b);
+// beta0..beta3 tree-paired, matching the SSE2 tier
+fn column_pass(neon: Neon, coef: &ColumnCoefficients, input: [f32x4; 8]) -> [f32x4; 8] {
+    let mul = |a, b| neon.mul_f32x4(a, b);
+    let add = |a, b| neon.add_f32x4(a, b);
+    let sub = |a, b| neon.sub_f32x4(a, b);
 
     let (in0, in1, in2, in3, in4, in5, in6, in7) =
         (input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7]);
@@ -139,11 +139,11 @@ fn column_pass(v1: V1, coef: &ColumnCoefficients, input: [f32x4; 8]) -> [f32x4; 
     ]
 }
 
-pub fn dct_inverse_8x8(v1: V1, data: &mut [f32; 64]) {
+pub fn dct_inverse_8x8(neon: Neon, data: &mut [f32; 64]) {
     let row_coef = RowCoefficients::new();
     for row in 0..8 {
         let base = row * 8;
-        let (lo, hi) = row_pass(v1, &row_coef, &data[base..base + 8]);
+        let (lo, hi) = row_pass(neon, &row_coef, &data[base..base + 8]);
         data[base] = lo.0;
         data[base + 1] = lo.1;
         data[base + 2] = lo.2;
@@ -154,7 +154,7 @@ pub fn dct_inverse_8x8(v1: V1, data: &mut [f32; 64]) {
         data[base + 7] = hi.3;
     }
 
-    let col_coef = ColumnCoefficients::new(v1);
+    let col_coef = ColumnCoefficients::new(neon);
     // Two batches of 4 columns each.
     for half in 0..2 {
         let offset = half * 4;
@@ -162,7 +162,7 @@ pub fn dct_inverse_8x8(v1: V1, data: &mut [f32; 64]) {
             let b = row * 8 + offset;
             f32x4(data[b], data[b + 1], data[b + 2], data[b + 3])
         });
-        let out = column_pass(v1, &col_coef, input);
+        let out = column_pass(neon, &col_coef, input);
         for (row, result) in out.iter().enumerate() {
             let b = row * 8 + offset;
             data[b] = result.0;
@@ -180,7 +180,7 @@ struct ForwardCoefficients {
 
 impl ForwardCoefficients {
     #[inline(always)]
-    fn new(_v1: V1) -> Self {
+    fn new(_neon: Neon) -> Self {
         let basis = forward_basis();
         Self {
             low: std::array::from_fn(|input| {
@@ -196,20 +196,20 @@ impl ForwardCoefficients {
 }
 
 #[inline(always)]
-fn forward_pass(v1: V1, coef: &[f32x4; 8], input: [f32; 8]) -> f32x4 {
-    let mul = |a, b| v1.mul_f32x4(a, b);
-    let add = |a, b| v1.add_f32x4(a, b);
-    let splat = |value: f32| v1.splat_f32x4(value);
+fn forward_pass(neon: Neon, coef: &[f32x4; 8], input: [f32; 8]) -> f32x4 {
+    let mul = |a, b| neon.mul_f32x4(a, b);
+    let add = |a, b| neon.add_f32x4(a, b);
+    let splat = |value: f32| neon.splat_f32x4(value);
 
-    let mut out = v1.splat_f32x4(0.0);
+    let mut out = neon.splat_f32x4(0.0);
     for index in 0..8 {
         out = add(out, mul(splat(input[index]), coef[index]));
     }
     out
 }
 
-pub fn dct_forward_8x8(v1: V1, data: &mut [f32; 64]) {
-    let coef = ForwardCoefficients::new(v1);
+pub fn dct_forward_8x8(neon: Neon, data: &mut [f32; 64]) {
+    let coef = ForwardCoefficients::new(neon);
 
     for row in 0..8 {
         let base = row * 8;
@@ -223,8 +223,8 @@ pub fn dct_forward_8x8(v1: V1, data: &mut [f32; 64]) {
             data[base + 6],
             data[base + 7],
         ];
-        let low = forward_pass(v1, &coef.low, input);
-        let high = forward_pass(v1, &coef.high, input);
+        let low = forward_pass(neon, &coef.low, input);
+        let high = forward_pass(neon, &coef.high, input);
         data[base] = low.0;
         data[base + 1] = low.1;
         data[base + 2] = low.2;
@@ -237,20 +237,18 @@ pub fn dct_forward_8x8(v1: V1, data: &mut [f32; 64]) {
 
     // Column pass: two four-lane halves, each batched across 4 columns via
     // SIMD lanes instead of gathering one column at a time with a stride-8
-    // read. Each row is loaded contiguously once per half and fanned into 8
-    // per-frequency accumulators, which are then stored back contiguously
-    // per output row.
+    // read.
     let basis = forward_basis();
     for half in 0..2 {
         let offset = half * 4;
-        let mut outputs = [v1.splat_f32x4(0.0); 8];
+        let mut outputs = [neon.splat_f32x4(0.0); 8];
 
         for row in 0..8 {
             let base = row * 8 + offset;
             let row_vec = f32x4(data[base], data[base + 1], data[base + 2], data[base + 3]);
             for v in 0..8 {
-                let coefficient = v1.splat_f32x4(basis[row][v]);
-                outputs[v] = v1.add_f32x4(outputs[v], v1.mul_f32x4(coefficient, row_vec));
+                let coefficient = neon.splat_f32x4(basis[row][v]);
+                outputs[v] = neon.add_f32x4(outputs[v], neon.mul_f32x4(coefficient, row_vec));
             }
         }
 

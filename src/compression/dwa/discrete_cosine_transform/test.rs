@@ -240,6 +240,64 @@ mod sse2_tests {
     }
 }
 
+// aarch64 NEON tier correctness tests.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_tests {
+    use pulp::aarch64::Neon;
+
+    use super::{
+        super::{aarch64::neon, dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized},
+        assert_blocks_match,
+    };
+
+    #[test]
+    fn neon_inverse_close_to_autovectorized_reference() {
+        assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
+            neon::dct_inverse_8x8(expect_neon(), data)
+        });
+    }
+
+    #[test]
+    fn neon_forward_close_to_autovectorized_reference() {
+        assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
+            neon::dct_forward_8x8(expect_neon(), data)
+        });
+    }
+
+    fn expect_neon() -> Neon {
+        Neon::try_new().expect("NEON is baseline on aarch64")
+    }
+}
+
+// 32-bit ARM NEON tier correctness tests. Needs nightly + `arm-neon`.
+#[cfg(all(test, target_arch = "arm", feature = "arm-neon"))]
+mod aarch32_tests {
+    use pulp::aarch32::Neon;
+
+    use super::{
+        super::{aarch32::neon, dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized},
+        assert_blocks_match,
+    };
+
+    #[test]
+    fn neon_inverse_close_to_autovectorized_reference() {
+        assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
+            neon::dct_inverse_8x8(expect_neon(), data)
+        });
+    }
+
+    #[test]
+    fn neon_forward_close_to_autovectorized_reference() {
+        assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
+            neon::dct_forward_8x8(expect_neon(), data)
+        });
+    }
+
+    fn expect_neon() -> Neon {
+        Neon::try_new().expect("NEON is baseline on aarch64/most 32-bit ARM hosts")
+    }
+}
+
 // Always-on (not SIMD-tier-gated) roundtrip tests: forward DCT followed by
 // inverse DCT must recover the original block. Runs whatever tier the runtime
 // dispatch selects on the host CPU.

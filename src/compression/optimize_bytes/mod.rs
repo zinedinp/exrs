@@ -5,11 +5,11 @@
 //! log-depth SIMD prefix sum and interleave as SSE unpack. On x86-64 we ship
 //! reconstruct via `x86/` tiers (`avx512` -> `avx2` -> `sse` -> scalar). On
 //! aarch64 we ship OpenEXR-faithful NEON via `aarch64/`. On 32-bit ARM we ship
-//! the same 16-byte algorithm via `arm/`: default [`portable_wide16`] (stable),
-//! or real NEON with feature `arm-neon` + nightly (local pulp `pulp::arm::Neon`).
+//! the same 16-byte algorithm via `aarch32/`: default [`portable_wide16`] (stable),
+//! or real NEON with feature `arm-neon` + nightly (local pulp `pulp::aarch32::Neon`).
 //!
 //! **Arm paths were not tested on real ARM hardware in this tree** — see
-//! [`aarch64`] / [`arm`].
+//! [`aarch64`] / [`aarch32`].
 
 /// x86 reconstruct tiers (`sse`, `avx2`, `avx512`) + dispatch. `doc(hidden)`-public
 /// so stage benches can call kernels directly, same pattern as DWA DCT.
@@ -28,7 +28,7 @@ pub mod aarch64;
 /// [`portable_wide16`]. **Not tested on real 32-bit ARM hardware.**
 #[cfg(target_arch = "arm")]
 #[doc(hidden)]
-pub mod arm;
+pub mod aarch32;
 
 /// Portable OpenEXR 16-byte log-depth reconstruct (pure Rust). Default
 /// production path on 32-bit ARM (stable); aarch64 fallback when Neon is
@@ -48,7 +48,7 @@ pub fn differences_to_samples(buffer: &mut [u8]) {
         return;
     }
     #[cfg(target_arch = "arm")]
-    if arm::try_differences_to_samples(buffer) {
+    if aarch32::try_differences_to_samples(buffer) {
         return;
     }
     differences_to_samples_scalar(buffer);
@@ -417,7 +417,7 @@ mod test {
     #[cfg(all(target_arch = "arm", feature = "arm-neon"))]
     #[test]
     fn arm_neon_reconstruct_matches_scalar_all_lengths() {
-        let neon = pulp::arm::Neon::try_new();
+        let neon = pulp::aarch32::Neon::try_new();
         for len in 0..192 {
             let source: Vec<u8> =
                 (0..len).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
@@ -427,7 +427,7 @@ mod test {
 
             if let Some(simd) = neon {
                 let mut simd_buf = source.clone();
-                arm::neon::differences_to_samples(simd, &mut simd_buf);
+                aarch32::neon::differences_to_samples(simd, &mut simd_buf);
                 assert_eq!(scalar, simd_buf, "arm neon reconstruct len={len}");
             }
         }
@@ -443,9 +443,9 @@ mod test {
         let mut scalar = source.clone();
         differences_to_samples_scalar(&mut scalar);
 
-        if let Some(simd) = pulp::arm::Neon::try_new() {
+        if let Some(simd) = pulp::aarch32::Neon::try_new() {
             let mut a = source.clone();
-            arm::neon::differences_to_samples(simd, &mut a);
+            aarch32::neon::differences_to_samples(simd, &mut a);
             assert_eq!(scalar, a, "arm neon large");
         }
     }
