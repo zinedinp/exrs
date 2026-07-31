@@ -1,5 +1,5 @@
 // A minimal PNG reader/writer for tests and examples, built on `flate2`
-// (already a real dependency of `exr` via the `zlib-rs` feature) instead of the
+// (already a dependency of `exr` via the `zlib-rs` feature) instead of the
 // `image`/`png` crates.
 
 use std::fs::File;
