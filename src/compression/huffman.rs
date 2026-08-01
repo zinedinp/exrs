@@ -170,6 +170,11 @@ compile_error!("huffman-lut-12 and huffman-lut-14 are mutually exclusive");
 #[cfg(all(feature = "huffman-lut-13", feature = "huffman-lut-14"))]
 compile_error!("huffman-lut-13 and huffman-lut-14 are mutually exclusive");
 
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(any(feature = "huffman-lut-12", feature = "huffman-lut-13", feature = "huffman-lut-14"))
+))]
+use dual_lut::CanonicalDecoder;
 #[cfg(any(
     feature = "huffman-lut-12",
     feature = "huffman-lut-13",
@@ -177,11 +182,6 @@ compile_error!("huffman-lut-13 and huffman-lut-14 are mutually exclusive");
     not(any(target_arch = "x86", target_arch = "x86_64"))
 ))]
 use fixed_lut::CanonicalDecoder;
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    not(any(feature = "huffman-lut-12", feature = "huffman-lut-13", feature = "huffman-lut-14"))
-))]
-use dual_lut::CanonicalDecoder;
 
 /// Single compile-time-fixed `LUT_BITS`. Active
 /// on non-x86 targets, or on any target with a `huffman-lut-*` feature
@@ -201,8 +201,16 @@ mod fixed_lut {
     const LUT_BITS: usize = 13;
     #[cfg(feature = "huffman-lut-14")]
     const LUT_BITS: usize = 14;
-    #[cfg(not(any(feature = "huffman-lut-12", feature = "huffman-lut-13", feature = "huffman-lut-14")))]
-    const LUT_BITS: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 14 } else { 13 };
+    #[cfg(not(any(
+        feature = "huffman-lut-12",
+        feature = "huffman-lut-13",
+        feature = "huffman-lut-14"
+    )))]
+    const LUT_BITS: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        14
+    } else {
+        13
+    };
     const LUT_SIZE: usize = 1 << LUT_BITS;
 
     /// Canonical left-justified decoder.
@@ -322,7 +330,8 @@ mod fixed_lut {
                 let len = usize::from(len);
                 let id = u64_to_usize(next_id[len], "huffman symbol id")?;
                 next_id[len] += 1;
-                *id_to_symbol.get_mut(id).ok_or_else(|| Error::invalid(INVALID_TABLE_ENTRY))? = symbol;
+                *id_to_symbol.get_mut(id).ok_or_else(|| Error::invalid(INVALID_TABLE_ENTRY))? =
+                    symbol;
             }
 
             let mut lj_base = [u64::MAX; MAX_CODE_LENGTH + 2];
@@ -388,7 +397,8 @@ mod fixed_lut {
             words.clear();
             let mut chunks = data.chunks_exact(8);
             for chunk in &mut chunks {
-                words.push(u64::from_be_bytes(<[u8; 8]>::try_from(chunk).expect("chunk size is 8")));
+                words
+                    .push(u64::from_be_bytes(<[u8; 8]>::try_from(chunk).expect("chunk size is 8")));
             }
             let remainder = chunks.remainder();
             if !remainder.is_empty() {
@@ -589,7 +599,10 @@ mod dual_lut {
         // size/sets, available on both vendors when present.
         for cache in cpuid.get_cache_parameters().into_iter().flatten() {
             if cache.level() == 1
-                && matches!(cache.cache_type(), raw_cpuid::CacheType::Data | raw_cpuid::CacheType::Unified)
+                && matches!(
+                    cache.cache_type(),
+                    raw_cpuid::CacheType::Data | raw_cpuid::CacheType::Unified
+                )
             {
                 return Some(
                     cache.associativity()
@@ -735,8 +748,9 @@ mod dual_lut {
                         let len = usize::from(len);
                         let id = u64_to_usize(next_id[len], "huffman symbol id")?;
                         next_id[len] += 1;
-                        *id_to_symbol.get_mut(id).ok_or_else(|| Error::invalid(INVALID_TABLE_ENTRY))? =
-                            symbol;
+                        *id_to_symbol
+                            .get_mut(id)
+                            .ok_or_else(|| Error::invalid(INVALID_TABLE_ENTRY))? = symbol;
                     }
 
                     let mut lj_base = [u64::MAX; MAX_CODE_LENGTH + 2];
@@ -985,12 +999,22 @@ mod dual_lut {
             words: &mut Vec<u64>,
         ) -> UnitResult {
             match self {
-                Self::Bits13(decoder) => {
-                    decoder.decode_into(data, bit_count, run_length_code, expected_output_size, out, words)
-                }
-                Self::Bits14(decoder) => {
-                    decoder.decode_into(data, bit_count, run_length_code, expected_output_size, out, words)
-                }
+                Self::Bits13(decoder) => decoder.decode_into(
+                    data,
+                    bit_count,
+                    run_length_code,
+                    expected_output_size,
+                    out,
+                    words,
+                ),
+                Self::Bits14(decoder) => decoder.decode_into(
+                    data,
+                    bit_count,
+                    run_length_code,
+                    expected_output_size,
+                    out,
+                    words,
+                ),
             }
         }
     }
