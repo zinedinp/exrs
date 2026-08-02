@@ -6,14 +6,9 @@ use std::cell::Cell;
 /// frames of a sequence at the same resolution), reusing one pixel buffer
 /// across every read instead of letting each read allocate its own.
 ///
-/// `collect_pixels_in_parallel`'s `create_pixels` closure runs once per
-/// `.from_file(..)` call and is a plain `Fn`, so it cannot own a `&mut` to
-/// external state directly; a `Cell` (or `RefCell`) is the straightforward
-/// way to hand a previous buffer back in. `Vec::resize` is then a no-op
-/// whenever the resolution has not changed, so only the very first read
-/// actually allocates. This matters because a fresh multi-hundred-megabyte
-/// buffer is not free even though allocating it looks free -> the pages behind
-/// it are not backed by real memory until the decode workers write to them
+/// Preferred API: `collect_flat_pixels` (flat buffer + `PixelSink`).
+/// `create_pixels` runs once per `.from_file(..)` and is a plain `Fn`, so it
+/// cannot own a `&mut` to external state directly
 fn main() {
     use exr::prelude::*;
 
@@ -27,7 +22,7 @@ fn main() {
         .required("G")
         .required("B")
         .optional("A", 1.0)
-        .collect_pixels_in_parallel(
+        .collect_flat_pixels(
             |resolution, _channels| {
                 let mut pixels = buffer.take();
                 pixels.resize(resolution.width() * resolution.height(), [0.0; 4]);

@@ -21,8 +21,10 @@ use crate::{
 /// Can be attached one more channel reader.
 ///
 /// Call `required` or `optional` on this object to declare another channel to
-/// be read from the file. Call `collect_pixels` at last to define how the
-/// previously declared pixels should be stored.
+/// be read from the file. Then finish with:
+/// - **[`collect_flat_pixels`](Self::collect_flat_pixels)** (preferred); one
+///   contiguous buffer + [`PixelSink`]; parallel decompress+write with `rayon`
+/// - [`collect_pixels`](Self::collect_pixels)
 pub trait ReadSpecificChannel: Sized + CheckDuplicates {
     /// A separate internal reader for the pixels. Will be of type `Recursive<_,
     /// SampleReader<_>>`, depending on the pixels of the specific channel
@@ -76,19 +78,21 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
         }
     }
 
-    /// Using two closures, define how to store the pixels.
-    /// The first closure creates an image, and the second closure inserts a
-    /// single pixel. The type of the pixel can be defined by the second
-    /// closure; it must be a tuple containing `f16`, `f32`, `u32` or
-    /// `Sample` values. See the examples for more information.
+    /// Define how to store pixels for custom / non-flat storage.
+    ///
+    /// The first closure creates the storage; the second inserts one pixel at
+    /// a `Vec2` position. Pixel samples must be `f16`, `f32`, `u32`, or
+    /// `Sample`
+    ///
+    /// Prefer [`collect_flat_pixels`](Self::collect_flat_pixels) when using
+    /// a single contiguous row-major buffer ([`FlatRowMajorPixelStorage`]
+    /// or [`pixel_vec::PixelVec`]) -> path is the performance default and
+    /// can write from decompression workers
     ///
     /// When `PixelStorage` implements [`RowMajorPixelStorage`] with
-    /// `Element = Pixel` (for example [`pixel_vec::PixelVec`] or
-    /// [`FlatRowMajorPixelStorage`]), the serial reader writes decoded pixels
-    /// directly into hoisted row slices and **may not call** `set_pixel`.
-    /// Use a non-identity `set_pixel` only with non-row-major storage, or
-    /// apply transforms after the read. For element types that differ from
-    /// `Pixel`
+    /// `Element = Pixel`, the serial reader may write into hoisted row slices
+    /// and not call `set_pixel`. Use a non-identity `set_pixel` only with
+    /// non-row-major storage, or transform after the read
     fn collect_pixels<Pixel, PixelStorage, CreatePixels, SetPixel>(
         self, create_pixels: CreatePixels, set_pixel: SetPixel
     ) -> CollectPixels<Self, Pixel, PixelStorage, CreatePixels, SetPixel>
@@ -100,7 +104,7 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
                 &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
             ) -> PixelStorage,
             SetPixel: Fn(&mut PixelStorage, Vec2<usize>, Pixel),
-{
+    {
         CollectPixels {
             read_channels: self,
             set_pixel,
@@ -109,24 +113,11 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
         }
     }
 
-    /// Like `collect_pixels`, but writes pixels directly from decompression
-    /// worker threads when reading with multiple threads (the default,
-    /// unless `.non_parallel()` is used), instead of `collect_pixels`'
-    /// single-threaded pixel-storage conversion. Can give a substantial
-    /// speedup on multi-core machines, at the cost of a different
-    /// `set_row_pixel` closure signature: it receives one row of the pixel
-    /// storage as a slice plus an `x` index, rather than the whole storage
-    /// plus a `Vec2` position. Requires `PixelStorage` to implement
-    /// [`RowMajorPixelStorage`] (implemented by [`FlatRowMajorPixelStorage`]).
-    /// A single contiguous buffer is required (rather than one `Vec` per row)
-    /// so that scanline workers can split disjoint full-width row bands out
-    /// of it. Tiled files also decompress in parallel; their pixel writes
-    /// share the flat buffer under a brief lock (tile rectangles may share
-    /// rows), still with correct per-tile `x` and width.
+    /// Preferred path: flat row-major storage + one [`PixelSink`].
     #[cfg(feature = "rayon")]
-    fn collect_pixels_in_parallel<Pixel, PixelStorage, CreatePixels, SetRowPixel>(
-        self, create_pixels: CreatePixels, set_row_pixel: SetRowPixel
-    ) -> CollectPixelsInParallel<Self, Pixel, PixelStorage, CreatePixels, SetRowPixel>
+    fn collect_flat_pixels<Pixel, PixelStorage, CreatePixels, Sink>(
+        self, create_pixels: CreatePixels, sink: Sink
+    ) -> CollectFlatPixels<Self, Pixel, PixelStorage, CreatePixels, Sink>
         where
             <Self::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
             <Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
@@ -135,41 +126,95 @@ pub trait ReadSpecificChannel: Sized + CheckDuplicates {
                 &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
             ) -> PixelStorage,
             PixelStorage: RowMajorPixelStorage,
-            SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel),
+            // `Clone` so each channels-reader can own a sink (parallel workers share via `Sync`).
+            Sink: PixelSink<PixelStorage::Element, Pixel> + Clone,
     {
-        CollectPixelsInParallel {
+        CollectFlatPixels {
             read_channels: self,
-            set_row_pixel,
+            sink,
             create_pixels,
             px: Default::default(),
         }
+    }
+
+    /// [`collect_flat_pixels`](Self::collect_flat_pixels) with [`CopyPixel`]
+    #[cfg(feature = "rayon")]
+    fn collect_flat_pixels_copy<Pixel, PixelStorage, CreatePixels>(
+        self, create_pixels: CreatePixels
+    ) -> CollectFlatPixels<Self, Pixel, PixelStorage, CreatePixels, CopyPixel>
+        where
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
+            CreatePixels: Fn(
+                Vec2<usize>,
+                &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
+            ) -> PixelStorage,
+            PixelStorage: RowMajorPixelStorage<Element = Pixel>,
+            Pixel: Copy,
+    {
+        self.collect_flat_pixels(create_pixels, CopyPixel)
+    }
+
+    /// Alias for [`collect_flat_pixels`](Self::collect_flat_pixels).
+    #[cfg(feature = "rayon")]
+    fn collect_pixels_in_parallel<Pixel, PixelStorage, CreatePixels, Sink>(
+        self, create_pixels: CreatePixels, set_row_pixel: Sink
+    ) -> CollectFlatPixels<Self, Pixel, PixelStorage, CreatePixels, Sink>
+        where
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
+            <Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions: IntoNonRecursive,
+            CreatePixels: Fn(
+                Vec2<usize>,
+                &<<Self::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive
+            ) -> PixelStorage,
+            PixelStorage: RowMajorPixelStorage,
+            Sink: PixelSink<PixelStorage::Element, Pixel> + Clone,
+    {
+        self.collect_flat_pixels(create_pixels, set_row_pixel)
+    }
+}
+
+/// Parallel-safe write of one decoded pixel into a flat row.
+pub trait PixelSink<Element, Pixel> {
+    /// Write `pixel` at column `x` of `row`.
+    fn write(&self, row: &mut [Element], x: usize, pixel: Pixel);
+}
+
+impl<F, Element, Pixel> PixelSink<Element, Pixel> for F
+where
+    F: Fn(&mut [Element], usize, Pixel),
+{
+    #[inline]
+    fn write(&self, row: &mut [Element], x: usize, pixel: Pixel) {
+        (self)(row, x, pixel);
+    }
+}
+
+/// [`PixelSink`] that copies the decoded pixel into the row (`Element == Pixel`).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CopyPixel;
+
+impl<P: Copy> PixelSink<P, P> for CopyPixel {
+    #[inline]
+    fn write(&self, row: &mut [P], x: usize, pixel: P) {
+        row[x] = pixel;
     }
 }
 
 /// Pixel storage backed by one contiguous, row-major buffer.
 ///
-/// Used by:
-/// - the **serial** [`collect_pixels`](ReadSpecificChannel::collect_pixels)
-///   path, which hoists one row slice per scanline when
-///   `Element = Pixel` (see that method's docs), and
-/// - [`collect_pixels_in_parallel`](ReadSpecificChannel::collect_pixels_in_parallel)
-///   (requires the `rayon` feature), which splits disjoint row ranges out to
-///   decompression worker threads.
+/// Required by [`collect_flat_pixels`](ReadSpecificChannel::collect_flat_pixels)
+/// (and its alias `collect_pixels_in_parallel`)
 ///
-/// Contiguity matters for the parallel path: scanline workers obtain a row
-/// range by splitting one buffer, and tiled workers write through a shared
-/// flat view, rather than indexing into separately heap-allocated rows.
+/// Contiguity matters for parallel decompress
 pub trait RowMajorPixelStorage {
-    /// The element type stored per pixel slot, as passed to `set_row_pixel`.
-    /// Not necessarily the same type `set_row_pixel` receives as its `Pixel`
-    /// argument -- like `SetPixel` in `collect_pixels`, `set_row_pixel` may
-    /// convert its `Pixel` argument to any representation this element type
-    /// needs.
+    /// Per-slot type in the flat buffer. The [`PixelSink`] may convert the
+    /// decoded `Pixel` into this type (or copy it when they match — see
+    /// [`CopyPixel`]).
     ///
-    /// When `Element` is the same type as the decoded `Pixel` passed to
+    /// When `Element` equals the decoded `Pixel` in
     /// [`collect_pixels`](ReadSpecificChannel::collect_pixels), the serial
-    /// reader may write pixels directly into row slices without calling
-    /// `set_pixel`.
+    /// reader may write row slices without calling `set_pixel`.
     type Element;
 
     /// Width of one row, in elements. Must match the image's pixel width.
@@ -382,18 +427,23 @@ pub struct CollectPixels<ReadChannels, Pixel, PixelStorage, CreatePixels, SetPix
     px: PhantomData<(Pixel, PixelStorage)>,
 }
 
-/// Like `CollectPixels`, but for `collect_pixels_in_parallel`: pixels are
-/// written via `set_row_pixel(row, x, pixel)` instead of `set_pixel(storage,
-/// position, pixel)`, so worker threads only ever need access to their own
-/// disjoint row range.
+/// Flat-buffer collect config: [`RowMajorPixelStorage`] + [`PixelSink`].
+///
+/// Produced by [`ReadSpecificChannel::collect_flat_pixels`] (and the
+/// `collect_pixels_in_parallel` alias). Workers only see row slices.
 #[cfg(feature = "rayon")]
 #[derive(Copy, Clone, Debug)]
-pub struct CollectPixelsInParallel<ReadChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel> {
+pub struct CollectFlatPixels<ReadChannels, Pixel, PixelStorage, CreatePixels, Sink> {
     read_channels: ReadChannels,
     create_pixels: CreatePixels,
-    set_row_pixel: SetRowPixel,
+    sink: Sink,
     px: PhantomData<(Pixel, PixelStorage)>,
 }
+
+/// Old name for [`CollectFlatPixels`].
+#[cfg(feature = "rayon")]
+pub type CollectPixelsInParallel<ReadChannels, Pixel, PixelStorage, CreatePixels, Sink> =
+    CollectFlatPixels<ReadChannels, Pixel, PixelStorage, CreatePixels, Sink>;
 
 impl<Inner: CheckDuplicates, Sample> CheckDuplicates for ReadRequiredChannel<Inner, Sample> {
     fn already_contains(&self, name: &Text) -> bool {
@@ -442,8 +492,8 @@ ReadChannels<'s> for CollectPixels<InnerChannels, Pixel, PixelStorage, CreatePix
 }
 
 #[cfg(feature = "rayon")]
-impl<'s, InnerChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel: 's>
-ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage, CreatePixels, SetRowPixel>
+impl<'s, InnerChannels, Pixel, PixelStorage, CreatePixels, Sink>
+ReadChannels<'s> for CollectFlatPixels<InnerChannels, Pixel, PixelStorage, CreatePixels, Sink>
     where
         InnerChannels: ReadSpecificChannel,
         <InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursivePixel: IntoTuple<Pixel>,
@@ -451,12 +501,12 @@ ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage,
         CreatePixels: Fn(Vec2<usize>, &<<InnerChannels::RecursivePixelReader as RecursivePixelReader>::RecursiveChannelDescriptions as IntoNonRecursive>::NonRecursive) -> PixelStorage,
         PixelStorage: RowMajorPixelStorage,
         PixelStorage::Element: Send,
-        SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
+        Sink: PixelSink<PixelStorage::Element, Pixel> + Sync + Clone + 's,
         InnerChannels::RecursivePixelReader: Sync,
         Pixel: Send,
 {
     type Reader = SpecificChannelsParallelReader<
-        PixelStorage, &'s SetRowPixel,
+        PixelStorage, Sink,
         InnerChannels::RecursivePixelReader,
         Pixel,
     >;
@@ -471,7 +521,7 @@ ReadChannels<'s> for CollectPixelsInParallel<InnerChannels, Pixel, PixelStorage,
         let pixel_storage = create(header.layer_size, &channel_descriptions);
 
         Ok(SpecificChannelsParallelReader {
-            set_row_pixel: &self.set_row_pixel,
+            sink: self.sink.clone(),
             pixel_storage,
             pixel_reader,
             line_pixels: Vec::new(),
@@ -568,17 +618,15 @@ where
     }
 }
 
-/// Like `SpecificChannelsReader`, but for `collect_pixels_in_parallel`: able
-/// to write pixels directly from decompression worker threads, since
-/// `PixelStorage: RowMajorPixelStorage` lets its rows be split into
-/// disjoint, independently-writable ranges.
+/// Flat-storage reader for [`collect_flat_pixels`](ReadSpecificChannel::collect_flat_pixels):
+/// workers write via [`PixelSink`] into row slices of a [`RowMajorPixelStorage`]
 #[cfg(feature = "rayon")]
 #[derive(Clone, Debug)]
-pub struct SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PixelReader, Pixel>
+pub struct SpecificChannelsParallelReader<PixelStorage, Sink, PixelReader, Pixel>
 where
     PixelReader: RecursivePixelReader,
 {
-    set_row_pixel: SetRowPixel,
+    sink: Sink,
     pixel_storage: PixelStorage,
     pixel_reader: PixelReader,
     /// Scratch for serial `read_block` / non-parallel fallback (workers keep their own).
@@ -587,15 +635,15 @@ where
 }
 
 #[cfg(feature = "rayon")]
-impl<PixelStorage, SetRowPixel, PxReader, Pixel> ChannelsReader
-    for SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PxReader, Pixel>
+impl<PixelStorage, Sink, PxReader, Pixel> ChannelsReader
+    for SpecificChannelsParallelReader<PixelStorage, Sink, PxReader, Pixel>
 where
     PxReader: RecursivePixelReader + Sync,
     PxReader::RecursivePixel: IntoTuple<Pixel>,
     PxReader::RecursiveChannelDescriptions: IntoNonRecursive,
     PixelStorage: RowMajorPixelStorage,
     PixelStorage::Element: Send,
-    SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
+    Sink: PixelSink<PixelStorage::Element, Pixel> + Sync,
     Pixel: Send,
 {
     type Channels = SpecificChannels<
@@ -627,7 +675,7 @@ where
         let storage_width = self.pixel_storage.width();
         let flat = self.pixel_storage.pixels_mut();
         let x0 = block.index.pixel_position.x();
-        let set_row_pixel = &self.set_row_pixel;
+        let sink = &self.sink;
 
         for (y_offset, line_bytes) in byte_lines.enumerate() {
             let y = block.index.pixel_position.y() + y_offset;
@@ -639,7 +687,7 @@ where
                 self.pixel_reader
                     .read_pixels(line_bytes, line_width, x_start, run, |px| px);
                 for (i, pixel) in run.iter().enumerate() {
-                    set_row_pixel(row, x0 + x_start + i, pixel.into_tuple());
+                    sink.write(row, x0 + x_start + i, pixel.into_tuple());
                 }
             }
         }
@@ -689,7 +737,7 @@ where
 
         let width = header.layer_size.width();
         let pixel_reader = &self.pixel_reader;
-        let set_row_pixel = &self.set_row_pixel;
+        let sink = &self.sink;
         let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
         // A flat, contiguous buffer (rather than one allocation per row) so
@@ -776,7 +824,7 @@ where
                                     [y_offset * storage_width .. (y_offset + 1) * storage_width];
 
                                 for (x_offset, pixel) in line.iter().enumerate() {
-                                    set_row_pixel(row, x_offset, pixel.into_tuple());
+                                    sink.write(row, x_offset, pixel.into_tuple());
                                 }
                             }
 
@@ -828,15 +876,15 @@ where
 }
 
 #[cfg(feature = "rayon")]
-impl<PixelStorage, SetRowPixel, PxReader, Pixel>
-    SpecificChannelsParallelReader<PixelStorage, SetRowPixel, PxReader, Pixel>
+impl<PixelStorage, Sink, PxReader, Pixel>
+    SpecificChannelsParallelReader<PixelStorage, Sink, PxReader, Pixel>
 where
     PxReader: RecursivePixelReader + Sync,
     PxReader::RecursivePixel: IntoTuple<Pixel>,
     PxReader::RecursiveChannelDescriptions: IntoNonRecursive,
     PixelStorage: RowMajorPixelStorage,
     PixelStorage::Element: Send,
-    SetRowPixel: Fn(&mut [PixelStorage::Element], usize, Pixel) + Sync,
+    Sink: PixelSink<PixelStorage::Element, Pixel> + Sync,
     Pixel: Send,
 {
     /// Parallel path for tiled files: decompress + convert on workers, write
@@ -851,7 +899,7 @@ where
     ) -> UnitResult {
         let bytes_per_pixel = header.channels.bytes_per_pixel;
         let pixel_reader = &self.pixel_reader;
-        let set_row_pixel = &self.set_row_pixel;
+        let sink = &self.sink;
         let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
         let storage_width = self.pixel_storage.width();
@@ -942,7 +990,7 @@ where
                                 let y = y0 + y_offset;
                                 let mut row = rows[y].lock().unwrap();
                                 for (x_offset, pixel) in line.iter().enumerate() {
-                                    set_row_pixel(&mut row, x0 + x_offset, pixel.into_tuple());
+                                    sink.write(&mut row, x0 + x_offset, pixel.into_tuple());
                                 }
                             }
 
@@ -1234,6 +1282,19 @@ mod test {
             );
             assert_eq!(out, input_f16s);
         }
+    }
+
+    #[test]
+    fn copy_pixel_sink_writes_identity() {
+        let mut row = [(0.0f32, 0.0), (0.0, 0.0), (0.0, 0.0)];
+        CopyPixel.write(&mut row, 1, (1.5, 2.5));
+        assert_eq!(row[1], (1.5, 2.5));
+        // Closure blanket still works
+        let convert = |r: &mut [(f32, f32)], x: usize, (a, b): (f32, f32)| {
+            r[x] = (a * 2.0, b * 2.0);
+        };
+        convert.write(&mut row, 0, (1.0, 2.0));
+        assert_eq!(row[0], (2.0, 4.0));
     }
 
     /// Flat (`RowMajorPixelStorage<Element = Pixel>`) and nested (`Vec<Vec<_>>`)

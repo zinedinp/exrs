@@ -57,7 +57,7 @@ fn bithash_half_tuple(width: usize, pixels: &[(f16, f16, f16)], mut h: u64) -> u
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: {} <file> <0|1 parallel> <iters> [half|f32x4|half_serial|half_parallel]", args[0]);
+        eprintln!("usage: {} <file> <0|1 parallel> <iters> [half|f32x4|half_serial|half_parallel|half_copy]", args[0]);
         eprintln!("  half          three half channels, 6 bytes/pixel (default; matches");
         eprintln!("                bench_openexr.cpp's three `Array2D<half>` planes)");
         eprintln!("  f32x4         RGBA as f32, 16 bytes/pixel (the previous default)");
@@ -66,6 +66,8 @@ fn main() {
         eprintln!("                row-hoisting fast path in `SpecificChannelsReader`)");
         eprintln!("  half_parallel same three half channels, through `collect_pixels_in_parallel`");
         eprintln!("                (Element = Pixel; parallel-vs-serial identity-shape comparison)");
+        eprintln!("  half_copy     same shape via `collect_flat_pixels_copy` + `CopyPixel`");
+        eprintln!("                (unified PixelSink path; identity Element == Pixel)");
         std::process::exit(1);
     }
 
@@ -246,9 +248,55 @@ fn main() {
             (total, hash)
         }
 
+        // Unified API: collect_flat_pixels_copy + CopyPixel (same storage as half_parallel)
+        "half_copy" => {
+            let buffer: Cell<Vec<(f16, f16, f16)>> = Cell::new(Vec::new());
+            let mut total = Duration::ZERO;
+            let mut hash = 0u64;
+
+            let mut reader = channels()
+                .required("R")
+                .required("G")
+                .required("B")
+                .collect_flat_pixels_copy(|resolution, _channels| {
+                    let mut pixels = buffer.take();
+                    pixels.resize(
+                        resolution.width() * resolution.height(),
+                        (f16::ZERO, f16::ZERO, f16::ZERO),
+                    );
+                    FlatRowMajorPixelStorage { width: resolution.width(), pixels }
+                })
+                .first_valid_layer()
+                .all_attributes();
+
+            if !parallel {
+                reader = reader.non_parallel();
+            }
+
+            for _ in 0..iters {
+                let start = Instant::now();
+
+                let pixels = reader
+                    .clone()
+                    .from_file(path)
+                    .expect("failed to read exr file")
+                    .layer_data
+                    .channel_data
+                    .pixels;
+
+                total += start.elapsed();
+                if hash_enabled {
+                    hash = bithash_half_tuple(pixels.width, &pixels.pixels, hash);
+                }
+                buffer.set(pixels.pixels);
+            }
+
+            (total, hash)
+        }
+
         other => {
             eprintln!(
-                "unknown storage mode {:?}, expected `half`, `f32x4`, `half_serial`, or `half_parallel`",
+                "unknown storage mode {:?}, expected `half`, `f32x4`, `half_serial`, `half_parallel`, or `half_copy`",
                 other
             );
             std::process::exit(1);
