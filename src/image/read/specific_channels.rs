@@ -4,6 +4,9 @@
 use std::any::Any;
 use std::marker::PhantomData;
 
+#[cfg(feature = "rayon")]
+use std::cell::RefCell;
+
 use crate::{
     block::{chunk::TileCoordinates, samples::*, UncompressedBlock},
     error::*,
@@ -220,6 +223,40 @@ fn line_run_pixels<Pixel>(channel_count: usize) -> usize {
     let element_bytes = std::mem::size_of::<Pixel>().max(1);
     let passes = channel_count.max(1).saturating_add(1); // per-channel read + write
     crate::cpu_cache::l1_resident_count(element_bytes, passes)
+}
+
+// Per-worker convert-line scratch for parallel readers.
+#[cfg(feature = "rayon")]
+thread_local! {
+    static WORKER_LINE_SCRATCH: RefCell<Option<Box<dyn Any>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(feature = "rayon")]
+#[inline]
+fn take_worker_line_scratch<P: Default + Clone + 'static>(width: usize) -> Vec<P> {
+    WORKER_LINE_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let mut vec = match slot.take() {
+            Some(boxed) => match boxed.downcast::<Vec<P>>() {
+                Ok(v) => *v,
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        if vec.len() < width {
+            vec.resize(width, P::default());
+        }
+        vec
+    })
+}
+
+#[cfg(feature = "rayon")]
+#[inline]
+fn return_worker_line_scratch<P: 'static>(vec: Vec<P>) {
+    WORKER_LINE_SCRATCH.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(vec));
+    });
 }
 
 fn write_decoded_line<PixelStorage: 'static, SetPixel, Pixel: 'static>(
@@ -711,24 +748,26 @@ where
 
                     let result = UncompressedBlock::decompress_chunk(chunk, meta_data, pedantic)
                         .and_then(|block| {
-                            let mut pixels = vec![PxReader::RecursivePixel::default(); width];
+                            // TLS scratch -> reused across chunks on this worker.
+                            // Full-width band (x=0)
+                            let mut pixels =
+                                take_worker_line_scratch::<PxReader::RecursivePixel>(width);
 
-                            // Full-width band (x=0). Run tiling on workers regressed at 8T.
                             for (y_offset, line_bytes) in
                                 block.data.chunks_exact(bytes_per_pixel * width).enumerate()
                             {
-                                pixel_reader.read_pixels(line_bytes, width, 0, &mut pixels, |px| px);
+                                let line = &mut pixels[..width];
+                                pixel_reader.read_pixels(line_bytes, width, 0, line, |px| px);
                                 let row = &mut this_elements
                                     [y_offset * storage_width .. (y_offset + 1) * storage_width];
 
-                                for (x_offset, pixel) in pixels.iter().enumerate() {
+                                for (x_offset, pixel) in line.iter().enumerate() {
                                     set_row_pixel(row, x_offset, pixel.into_tuple());
                                 }
                             }
 
-                            // recycled from the same worker that decompressed
-                            // into it, so the next chunk on this thread can
-                            // reuse the pages it just faulted in
+                            return_worker_line_scratch(pixels);
+                            // same worker recycles decompress buf → next chunk reuses pages
                             crate::block::pool::recycle(block.data);
                             Ok(())
                         });
@@ -866,33 +905,34 @@ where
                             debug_assert_eq!(block.index.pixel_position.x(), x0);
                             debug_assert_eq!(block.index.pixel_position.y(), y0);
 
-                            let mut pixels =
-                                vec![PxReader::RecursivePixel::default(); block_width];
+                            let mut pixels = take_worker_line_scratch::<PxReader::RecursivePixel>(
+                                block_width,
+                            );
 
                             for (y_offset, line_bytes) in block
                                 .data
                                 .chunks_exact(bytes_per_pixel * block_width)
                                 .enumerate()
                             {
-                                // Sample conversion stays outside the lock;
-                                // only this row's write is serialized, and
-                                // only against other tiles that share this
-                                // exact row.
+                                // Convert outside the lock; only this row's
+                                // write contends with tiles that share y.
+                                let line = &mut pixels[..block_width];
                                 pixel_reader.read_pixels(
                                     line_bytes,
                                     block_width,
                                     0,
-                                    &mut pixels,
+                                    line,
                                     |px| px,
                                 );
 
                                 let y = y0 + y_offset;
                                 let mut row = rows[y].lock().unwrap();
-                                for (x_offset, pixel) in pixels.iter().enumerate() {
+                                for (x_offset, pixel) in line.iter().enumerate() {
                                     set_row_pixel(&mut row, x0 + x_offset, pixel.into_tuple());
                                 }
                             }
 
+                            return_worker_line_scratch(pixels);
                             crate::block::pool::recycle(block.data);
                             Ok(())
                         });
