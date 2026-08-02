@@ -39,11 +39,12 @@ impl<DeepOrFlatSamples> ReadLargestLevel<DeepOrFlatSamples> {
     /// the layer. The alpha channel will contain the value `1.0` if no
     /// alpha channel can be found in the image.
     ///
-    /// Using two closures, define how to store the pixels.
-    /// The first closure creates an image, and the second closure inserts a
-    /// single pixel. The type of the pixel can be defined by the second
-    /// closure; it must be a tuple containing four values, each being
-    /// either `f16`, `f32`, `u32` or `Sample`.
+    /// Using two closures, define how to store the pixels (any storage shape).
+    /// The first closure creates an image, and the second inserts a single
+    /// pixel at a `Vec2` position. Prefer
+    /// [`specific_channels`](Self::specific_channels) +
+    /// [`collect_flat_pixels`](crate::image::read::specific_channels::ReadSpecificChannel::collect_flat_pixels)
+    /// with [`FlatRowMajorPixelStorage`] when you want the fast parallel path.
     ///
     /// Throws an error for images with deep data or subsampling.
     /// Use `specific_channels` or `all_channels` if you want to read something

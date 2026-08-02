@@ -19,18 +19,18 @@ pub enum Sample {
 
 impl Sample {
     /// Create a sample containing a 32-bit float.
-    pub fn f32(f32: f32) -> Self {
-        Sample::F32(f32)
+    pub fn f32(value: f32) -> Self {
+        Sample::F32(value)
     }
 
     /// Create a sample containing a 16-bit float.
-    pub fn f16(f16: f16) -> Self {
-        Sample::F16(f16)
+    pub fn f16(value: f16) -> Self {
+        Sample::F16(value)
     }
 
     /// Create a sample containing a 32-bit integer.
-    pub fn u32(u32: u32) -> Self {
-        Sample::U32(u32)
+    pub fn u32(value: u32) -> Self {
+        Sample::U32(value)
     }
 
     /// Convert the sample to an f16 value. This has lower precision than f32.
@@ -232,12 +232,15 @@ impl FromNativeSample for f32 {
         value as Self
     }
 
-    // f16 is a custom type
-    // so the compiler can not automatically vectorize the conversion
-    // that's why we need to specialize this function
+    // f16 is a custom type — needs an explicit bulk path for SIMD.
     #[inline]
     fn from_f16s(from: &[f16], to: &mut [Self]) {
         from.convert_to_f32_slice(to);
+    }
+
+    #[inline]
+    fn from_f32s(from: &[f32], to: &mut [Self]) {
+        to.copy_from_slice(from);
     }
 }
 
@@ -255,6 +258,11 @@ impl FromNativeSample for u32 {
     #[inline]
     fn from_u32(value: u32) -> Self {
         value
+    }
+
+    #[inline]
+    fn from_u32s(from: &[u32], to: &mut [Self]) {
+        to.copy_from_slice(from);
     }
 }
 
@@ -274,9 +282,11 @@ impl FromNativeSample for f16 {
         Self::from_f32(value as f32)
     }
 
-    // f16 is a custom type
-    // so the compiler can not automatically vectorize the conversion
-    // that's why we need to specialize this function
+    #[inline]
+    fn from_f16s(from: &[f16], to: &mut [Self]) {
+        to.copy_from_slice(from);
+    }
+
     #[inline]
     fn from_f32s(from: &[f32], to: &mut [Self]) {
         to.convert_from_f32_slice(from);
