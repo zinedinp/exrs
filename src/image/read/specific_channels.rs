@@ -2,10 +2,8 @@
 //! This is not a zero-cost abstraction.
 
 use std::any::Any;
-use std::marker::PhantomData;
-
-#[cfg(feature = "rayon")]
 use std::cell::RefCell;
+use std::marker::PhantomData;
 
 use crate::{
     block::{chunk::TileCoordinates, samples::*, UncompressedBlock},
@@ -225,7 +223,30 @@ fn line_run_pixels<Pixel>(channel_count: usize) -> usize {
     crate::cpu_cache::l1_resident_count(element_bytes, passes)
 }
 
-// Per-worker convert-line scratch for parallel readers.
+// TLS `Vec<T>` via `Any` monomorphize pixel/sample types share one slot
+fn take_tls_any_vec<P: Default + Clone + 'static>(
+    cell: &RefCell<Option<Box<dyn Any>>>,
+    len: usize,
+) -> Vec<P> {
+    let mut slot = cell.borrow_mut();
+    let mut vec = match slot.take() {
+        Some(boxed) => match boxed.downcast::<Vec<P>>() {
+            Ok(v) => *v,
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    if vec.len() < len {
+        vec.resize(len, P::default());
+    }
+    vec
+}
+
+fn return_tls_any_vec<P: 'static>(cell: &RefCell<Option<Box<dyn Any>>>, vec: Vec<P>) {
+    *cell.borrow_mut() = Some(Box::new(vec));
+}
+
+// Per-worker convert-line scratch for parallel readers (`RecursivePixel`).
 #[cfg(feature = "rayon")]
 thread_local! {
     static WORKER_LINE_SCRATCH: RefCell<Option<Box<dyn Any>>> =
@@ -235,28 +256,21 @@ thread_local! {
 #[cfg(feature = "rayon")]
 #[inline]
 fn take_worker_line_scratch<P: Default + Clone + 'static>(width: usize) -> Vec<P> {
-    WORKER_LINE_SCRATCH.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let mut vec = match slot.take() {
-            Some(boxed) => match boxed.downcast::<Vec<P>>() {
-                Ok(v) => *v,
-                Err(_) => Vec::new(),
-            },
-            None => Vec::new(),
-        };
-        if vec.len() < width {
-            vec.resize(width, P::default());
-        }
-        vec
-    })
+    WORKER_LINE_SCRATCH.with(|cell| take_tls_any_vec(cell, width))
 }
 
 #[cfg(feature = "rayon")]
 #[inline]
 fn return_worker_line_scratch<P: 'static>(vec: Vec<P>) {
-    WORKER_LINE_SCRATCH.with(|cell| {
-        *cell.borrow_mut() = Some(Box::new(vec));
-    });
+    WORKER_LINE_SCRATCH.with(|cell| return_tls_any_vec(cell, vec));
+}
+
+// Channel-plane convert scratch for `read_and_convert_all_samples_batched`
+thread_local! {
+    static CONVERT_FROM_SCRATCH: RefCell<Option<Box<dyn Any>>> =
+        const { RefCell::new(None) };
+    static CONVERT_TO_SCRATCH: RefCell<Option<Box<dyn Any>>> =
+        const { RefCell::new(None) };
 }
 
 fn write_decoded_line<PixelStorage: 'static, SetPixel, Pixel: 'static>(
@@ -1100,67 +1114,56 @@ impl<Sample: FromNativeSample> SampleReader<Sample> {
     }
 }
 
-/// Does the same as `convert_batch(in_bytes.chunks().map(From::from_bytes))`,
-/// but vectorized. Reads the samples for one line, using the sample type
-/// specified in the file, and then converts those to the desired sample types.
-/// Uses batches to allow vectorization, converting multiple values with one
-/// instruction. Does not convert endianness.
+/// Read one channel plane run from `in_bytes` and convert file sample type
 fn read_and_convert_all_samples_batched<'t, From, To>(
     mut in_bytes: impl Read,
     out_samples: &mut impl ExactSizeIterator<Item = &'t mut To>,
     convert_batch: fn(&[From], &mut [To]),
 ) where
-    From: Data + Default + Copy,
-    To: 't + Default + Copy,
+    From: Data + Default + Copy + 'static,
+    To: 't + Default + Copy + 'static,
 {
-    // this is not a global! why is this warning triggered?
-    #[allow(non_upper_case_globals)]
-    const batch_size: usize = 16;
-
     let total_sample_count = out_samples.len();
-    let batch_count = total_sample_count / batch_size;
-    let remaining_samples_count = total_sample_count % batch_size;
+    if total_sample_count == 0 {
+        return;
+    }
+
+    let run = crate::cpu_cache::l1_resident_count(
+        std::mem::size_of::<From>()
+            .saturating_add(std::mem::size_of::<To>())
+            .max(1),
+        2,
+    );
+
+    let mut from_buf =
+        CONVERT_FROM_SCRATCH.with(|cell| take_tls_any_vec::<From>(cell, run.min(total_sample_count)));
+    let mut to_buf =
+        CONVERT_TO_SCRATCH.with(|cell| take_tls_any_vec::<To>(cell, run.min(total_sample_count)));
 
     let len_error_msg = "sample count was miscalculated";
     let byte_error_msg = "error when reading from in-memory slice";
 
-    // write samples from a given slice to the output iterator. should be inlined.
-    let output_n_samples = &mut move |samples: &[To]| {
-        for converted_sample in samples {
-            *out_samples.next().expect(len_error_msg) = *converted_sample;
+    let mut remaining = total_sample_count;
+    while remaining > 0 {
+        let n = run.min(remaining);
+        if from_buf.len() < n {
+            from_buf.resize(n, From::default());
         }
-    };
-
-    // read samples from the byte source into a given slice. should be inlined.
-    // todo: use #[inline] when available
-    // error[E0658]: attributes on expressions are experimental,
-    // see issue #15701 <https://github.com/rust-lang/rust/issues/15701> for more information
-    let read_n_samples = &mut move |samples: &mut [From]| {
-        Data::read_slice_ne(&mut in_bytes, samples).expect(byte_error_msg);
-    };
-
-    // temporary arrays with fixed size, operations should be vectorized within
-    // these arrays
-    let mut source_samples_batch: [From; batch_size] = Default::default();
-    let mut desired_samples_batch: [To; batch_size] = Default::default();
-
-    // first convert all whole batches, size statically known to be 16 element
-    // arrays
-    for _ in 0..batch_count {
-        read_n_samples(&mut source_samples_batch);
-        convert_batch(source_samples_batch.as_slice(), desired_samples_batch.as_mut_slice());
-        output_n_samples(&desired_samples_batch);
+        if to_buf.len() < n {
+            to_buf.resize(n, To::default());
+        }
+        let from = &mut from_buf[..n];
+        let to = &mut to_buf[..n];
+        Data::read_slice_ne(&mut in_bytes, from).expect(byte_error_msg);
+        convert_batch(from, to);
+        for sample in to.iter() {
+            *out_samples.next().expect(len_error_msg) = *sample;
+        }
+        remaining -= n;
     }
 
-    // then convert a partial remaining batch, size known only at runtime
-    if remaining_samples_count != 0 {
-        let source_samples_batch = &mut source_samples_batch[..remaining_samples_count];
-        let desired_samples_batch = &mut desired_samples_batch[..remaining_samples_count];
-
-        read_n_samples(source_samples_batch);
-        convert_batch(source_samples_batch, desired_samples_batch);
-        output_n_samples(desired_samples_batch);
-    }
+    CONVERT_FROM_SCRATCH.with(|cell| return_tls_any_vec(cell, from_buf));
+    CONVERT_TO_SCRATCH.with(|cell| return_tls_any_vec(cell, to_buf));
 }
 
 #[cfg(test)]
@@ -1189,6 +1192,47 @@ mod test {
             let out_f16_samples_naive = input_f32s.iter().cloned().map(f16::from_f32);
 
             assert!(out_f16_samples_naive.eq(out_f16_samples_batched));
+        }
+    }
+
+    #[test]
+    fn bulk_f16_to_f32_matches_naive() {
+        for total_array_size in [1, 15, 16, 17, 256, 1024, 8192] {
+            let input_f16s: Vec<f16> = (0..total_array_size)
+                .map(|i| f16::from_f32((i as f32) * 0.01))
+                .collect();
+            let in_bytes: Vec<u8> =
+                input_f16s.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+            let mut out = vec![0.0f32; total_array_size];
+            read_and_convert_all_samples_batched(
+                &mut in_bytes.as_slice(),
+                &mut out.iter_mut(),
+                f32::from_f16s,
+            );
+
+            for (i, &bits) in input_f16s.iter().enumerate() {
+                assert_eq!(out[i], bits.to_f32(), "index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_f16_identity_matches() {
+        for total_array_size in [1, 64, 4096] {
+            let input_f16s: Vec<f16> = (0..total_array_size)
+                .map(|i| f16::from_bits(i as u16))
+                .collect();
+            let in_bytes: Vec<u8> =
+                input_f16s.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+            let mut out = vec![f16::ZERO; total_array_size];
+            read_and_convert_all_samples_batched(
+                &mut in_bytes.as_slice(),
+                &mut out.iter_mut(),
+                f16::from_f16s,
+            );
+            assert_eq!(out, input_f16s);
         }
     }
 
