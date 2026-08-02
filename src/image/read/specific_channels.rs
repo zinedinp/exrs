@@ -1,6 +1,7 @@
 //! How to read arbitrary but specific selection of arbitrary channels.
 //! This is not a zero-cost abstraction.
 
+use std::any::Any;
 use std::marker::PhantomData;
 
 use crate::{
@@ -220,55 +221,50 @@ impl<T> RowMajorPixelStorage for crate::image::pixel_vec::PixelVec<T> {
 /// Lines narrower than this are still handled in a single run.
 const LINE_RUN_PIXELS: usize = 1024;
 
-// Autoref-specialization helpers for the serial reader: prefer a row-hoisted
-// write when `PixelStorage: RowMajorPixelStorage<Element = Pixel>`, otherwise
-// fall back to the opaque `set_pixel` closure.
-//
-// `ctx.go(...)` tries the `WriteLineCtx` (by-value) impl first, if that impl's
-// bounds fail, method resolution reborrows as `&mut WriteLineCtx` and hits the
-// closure impl. One trait with two `Self` types avoids ambiguous-method errors
-// from two same-named trait methods.
-// See https://github.com/dtolnay/case-studies/blob/master/autoref-specialization/
-struct WriteLineCtx<'a, S, F> {
-    storage: &'a mut S,
-    set_pixel: &'a F,
-}
-
-trait WriteDecodedLine<Pixel> {
-    fn go(self, y: usize, x0: usize, pixels: impl ExactSizeIterator<Item = Pixel>);
-}
-
-impl<'a, S, F, Pixel> WriteDecodedLine<Pixel> for WriteLineCtx<'a, S, F>
-where
-    S: RowMajorPixelStorage<Element = Pixel>,
+fn write_decoded_line<PixelStorage: 'static, SetPixel, Pixel: 'static>(
+    storage: &mut PixelStorage,
+    set_pixel: &SetPixel,
+    y: usize,
+    x0: usize,
+    pixels: impl ExactSizeIterator<Item = Pixel>,
+) where
+    SetPixel: Fn(&mut PixelStorage, Vec2<usize>, Pixel),
 {
-    #[inline]
-    fn go(self, y: usize, x0: usize, pixels: impl ExactSizeIterator<Item = Pixel>) {
-        let width = self.storage.width();
-        let flat = self.storage.pixels_mut();
-
+    fn write_row<Pixel>(
+        flat: &mut [Pixel],
+        width: usize,
+        y: usize,
+        x0: usize,
+        pixels: impl ExactSizeIterator<Item = Pixel>,
+    ) {
         // Slice down to exactly the pixels this line writes, so the loop below
         // is a straight `zip` over two equal-length sequences: one bounds check
         // per line instead of one per pixel, and no `x0 + i` address arithmetic
         // (the destination is just a walking pointer).
         let start = y * width + x0;
         let row = &mut flat[start..start + pixels.len()];
-
         for (destination, pixel) in row.iter_mut().zip(pixels) {
             *destination = pixel;
         }
     }
-}
 
-impl<'a, 'b, S, F, Pixel> WriteDecodedLine<Pixel> for &'b mut WriteLineCtx<'a, S, F>
-where
-    F: Fn(&mut S, Vec2<usize>, Pixel),
-{
-    #[inline]
-    fn go(self, y: usize, x0: usize, pixels: impl ExactSizeIterator<Item = Pixel>) {
-        for (i, pixel) in pixels.enumerate() {
-            (self.set_pixel)(self.storage, Vec2(x0 + i, y), pixel);
-        }
+    // Each `downcast_mut` reborrows `storage` only for the duration of the
+    // `if let`; when it misses, the original `&mut PixelStorage` binding is
+    // free again for the next attempt, or for the closure fallback
+    if let Some(flat) =
+        (&mut *storage as &mut dyn Any).downcast_mut::<FlatRowMajorPixelStorage<Pixel>>()
+    {
+        return write_row(&mut flat.pixels, flat.width, y, x0, pixels);
+    }
+    if let Some(vec) =
+        (&mut *storage as &mut dyn Any).downcast_mut::<crate::image::pixel_vec::PixelVec<Pixel>>()
+    {
+        let width = vec.resolution.width();
+        return write_row(&mut vec.pixels, width, y, x0, pixels);
+    }
+
+    for (i, pixel) in pixels.enumerate() {
+        set_pixel(storage, Vec2(x0 + i, y), pixel);
     }
 }
 
@@ -359,7 +355,7 @@ impl<Inner: CheckDuplicates, Sample> CheckDuplicates for ReadOptionalChannel<Inn
     }
 }
 
-impl<'s, InnerChannels, Pixel, PixelStorage, CreatePixels, SetPixel: 's>
+impl<'s, InnerChannels, Pixel: 'static, PixelStorage: 'static, CreatePixels, SetPixel: 's>
 ReadChannels<'s> for CollectPixels<InnerChannels, Pixel, PixelStorage, CreatePixels, SetPixel>
     where
         InnerChannels: ReadSpecificChannel,
@@ -447,7 +443,7 @@ where
     px: PhantomData<Pixel>,
 }
 
-impl<PixelStorage, SetPixel, PxReader, Pixel> ChannelsReader
+impl<PixelStorage: 'static, SetPixel, PxReader, Pixel: 'static> ChannelsReader
     for SpecificChannelsReader<PixelStorage, SetPixel, PxReader, Pixel>
 where
     PxReader: RecursivePixelReader,
@@ -499,13 +495,11 @@ where
                 self.pixel_reader.read_pixels(line_bytes, line_width, x_start, run, |px| px);
 
                 // Prefer a row-hoisted write when `PixelStorage: RowMajorPixelStorage`
-                // with `Element = Pixel`,
-                // otherwise call the opaque `set_pixel` closure once per pixel.
-                let mut ctx = WriteLineCtx {
-                    storage: &mut self.pixel_storage,
-                    set_pixel: &self.set_pixel,
-                };
-                ctx.go(
+                // with `Element = Pixel`, otherwise call the opaque `set_pixel`
+                // closure once per pixel
+                write_decoded_line(
+                    &mut self.pixel_storage,
+                    &self.set_pixel,
                     origin.y() + y_offset,
                     origin.x() + x_start,
                     run.iter().map(|pixel| pixel.into_tuple()),
@@ -1187,23 +1181,13 @@ mod test {
                            _: (f32, f32, f32)| {
                     panic!("flat path must not call set_pixel when Element = Pixel");
                 };
-                // by-value `GoFlat` path — no `mut` needed
-                let ctx = WriteLineCtx {
-                    storage: &mut flat,
-                    set_pixel: &set,
-                };
-                ctx.go(y, 0, line.iter().copied());
+                write_decoded_line(&mut flat, &set, y, 0, line.iter().copied());
             }
             {
                 let set = |img: &mut Vec<Vec<(f32, f32, f32)>>, pos: Vec2<usize>, px| {
                     img[pos.y()][pos.x()] = px;
                 };
-                // reborrow path needs `mut` for `&mut WriteLineCtx`
-                let mut ctx = WriteLineCtx {
-                    storage: &mut nested,
-                    set_pixel: &set,
-                };
-                ctx.go(y, 0, line.iter().copied());
+                write_decoded_line(&mut nested, &set, y, 0, line.iter().copied());
             }
         }
 
