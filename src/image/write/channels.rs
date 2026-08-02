@@ -1,6 +1,9 @@
 //! How to read arbitrary channels and rgb channels.
 
+use std::any::{Any, TypeId};
 use std::marker::PhantomData;
+
+use half::slice::HalfFloatSliceExt;
 
 use crate::{
     block::{samples::*, *},
@@ -358,8 +361,14 @@ where
 
         // match outside the loop to avoid matching on every single sample
         match self.target_sample_type {
-            // TODO does this boil down to a `memcpy` where the sample type equals the type
-            // parameter?
+            // f32 source samples converting to f16 storage is by far the most common case
+            // (in-memory f32 buffers written out as half-float channels); bulk-convert
+            // through `half`'s SIMD slice conversion instead of one `f16::from_f32` call
+            // per sample.
+            SampleType::F16 if TypeId::of::<Sample>() == TypeId::of::<f32>() => {
+                write_f32_samples_as_f16_bulk(samples, byte_writer);
+            }
+
             SampleType::F16 => {
                 for sample in samples {
                     sample.to_f16().write_ne(byte_writer).expect(write_error_msg);
@@ -379,6 +388,52 @@ where
 
         debug_assert!(byte_writer.is_empty(), "all samples are written, but more were expected");
     }
+}
+
+/// Bulk f32-to-f16 conversion path for [`SampleWriter::write_own_samples`]. Only ever called
+/// when `Sample == f32` (checked by the caller via `TypeId`), so the per-element `downcast_ref`
+/// below always succeeds
+fn write_f32_samples_as_f16_bulk<Sample: 'static>(
+    samples: impl ExactSizeIterator<Item = Sample>,
+    byte_writer: &mut &mut [u8],
+) {
+    thread_local! {
+        static F32_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static F16_SCRATCH: std::cell::RefCell<Vec<f16>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    // f32 scratch is written then re-read, f16 scratch is written then re-read (by the bulk
+    // write) -- 2 live buffers, each touched twice.
+    let run = crate::cpu_cache::l1_resident_count(size_of::<f32>() + size_of::<f16>(), 2);
+
+    let mut remaining = samples.len();
+    let mut samples = samples;
+
+    let mut f32_buffer = F32_SCRATCH.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    let mut f16_buffer = F16_SCRATCH.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+
+    while remaining > 0 {
+        let this_run = run.min(remaining);
+
+        f32_buffer.clear();
+        f32_buffer.extend((&mut samples).take(this_run).map(|sample| {
+            *(&sample as &dyn Any)
+                .downcast_ref::<f32>()
+                .expect("write_f32_samples_as_f16_bulk called for a non-f32 Sample")
+        }));
+        debug_assert_eq!(f32_buffer.len(), this_run);
+
+        f16_buffer.resize(this_run, f16::ZERO);
+        f16_buffer.convert_from_f32_slice(&f32_buffer);
+
+        f16::write_slice_ne(byte_writer, &f16_buffer)
+            .expect("invalid memory buffer length when writing");
+
+        remaining -= this_run;
+    }
+
+    F32_SCRATCH.with(|buffer| *buffer.borrow_mut() = f32_buffer);
+    F16_SCRATCH.with(|buffer| *buffer.borrow_mut() = f16_buffer);
 }
 
 impl RecursivePixelWriter<Self> for NoneMore {

@@ -147,13 +147,7 @@ const MAX_CODE_LENGTH: usize = 58;
 //   rejected on this basis: the bounds check can't be proven away once the
 //   shift amount and the table length are two independently-loaded runtime
 //   values, even though they're equal by construction). Once per process, a
-//   `raw-cpuid`-based probe (leaf 4 deterministic cache parameters, or leaf
-//   0x8000_0005 on older AMD parts) picks 14 bits if the detected L1d is
-//   >=96 KiB (the raw 80 KiB two-table footprint plus ~16 KiB headroom for
-//   the rest of the decoder's per-iteration working set.
-//   Hybrid P/E parts (leaf 7 EDX bit 15) always get 13 bits, since the probe
-//   only sees one core's L1d. Revisit if a hybrid part ships with >80 KiB
-//   L1d on every core type.
+//   `cpu_cache` probe picks 14-bit when L1d >= 96 KiB; hybrid stays on 13-bit.
 // - `fixed_lut` (everything else -- non-x86 targets, or any target with a
 //   `huffman-lut-*` feature pinned): a single compile-time `LUT_BITS`, same
 //   as before this runtime-dispatch addition -- a pinned feature wins
@@ -588,54 +582,13 @@ mod dual_lut {
     /// benchmarked -- see the doc comment above `MAX_CODE_LENGTH`.
     const MIN_L1D_BYTES_FOR_14_BIT_LUT: usize = 96 * 1024;
 
-    /// Detected L1 data cache size in bytes, or `None` if CPUID doesn't
-    /// report usable cache topology (e.g. some hypervisors).
-    fn detected_l1d_bytes() -> Option<usize> {
-        let cpuid = raw_cpuid::CpuId::new();
-
-        // Leaf 4 (or AMD's equivalent 0x8000_001D) deterministic cache
-        // parameters: precise size from associativity/partitions/line
-        // size/sets, available on both vendors when present.
-        for cache in cpuid.get_cache_parameters().into_iter().flatten() {
-            if cache.level() == 1
-                && matches!(cache.cache_type(), raw_cpuid::CacheType::Data | raw_cpuid::CacheType::Unified)
-            {
-                return Some(
-                    cache.associativity()
-                        * cache.physical_line_partitions()
-                        * cache.coherency_line_size()
-                        * cache.sets(),
-                );
-            }
-        }
-
-        // Older AMD parts without leaf 4: leaf 0x8000_0005, L1d size in KB
-        // directly (reserved/zero on Intel, hence the zero check).
-        if let Some(l1) = cpuid.get_l1_cache_and_tlb_info() {
-            let size = usize::from(l1.dcache_size()) * 1024;
-            if size > 0 {
-                return Some(size);
-            }
-        }
-
-        None
-    }
-
-    /// Leaf 7 subleaf 0 EDX bit 15: "hybrid part". No typed getter in
-    /// `raw-cpuid` 11.6.0, so read via its raw `cpuid!` macro.
-    fn is_hybrid_cpu() -> bool {
-        const HYBRID_BIT: u32 = 1 << 15;
-        raw_cpuid::cpuid!(7, 0).edx & HYBRID_BIT != 0
-    }
-
-    /// Resolved once per process, so on a hybrid part it only ever sees one
-    /// core's L1d. Never picks 14 bits on hybrid parts to sidestep that;
-    /// revisit if a hybrid part ships with >80 KiB L1d on every core type.
+    /// Once per process; hybrid always stays on 13-bit.
     fn use_14_bit_lut() -> bool {
         static USE_14: OnceLock<bool> = OnceLock::new();
         *USE_14.get_or_init(|| {
-            !is_hybrid_cpu()
-                && detected_l1d_bytes().is_some_and(|bytes| bytes >= MIN_L1D_BYTES_FOR_14_BIT_LUT)
+            !crate::cpu_cache::is_hybrid_cpu()
+                && crate::cpu_cache::detected_l1d_bytes()
+                    .is_some_and(|bytes| bytes >= MIN_L1D_BYTES_FOR_14_BIT_LUT)
         })
     }
 

@@ -48,6 +48,8 @@ pub mod meta;
 pub mod block;
 pub mod error;
 
+pub(crate) mod cpu_cache;
+
 #[macro_use]
 extern crate smallvec;
 

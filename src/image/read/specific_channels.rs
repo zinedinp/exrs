@@ -215,11 +215,12 @@ impl<T> RowMajorPixelStorage for crate::image::pixel_vec::PixelVec<T> {
     }
 }
 
-/// How many pixels of one scanline are decoded before being written out, so
-/// that the scratch line, the source bytes and the destination run all stay
-/// resident while `read_pixels` makes its one pass per channel over them.
-/// Lines narrower than this are still handled in a single run.
-const LINE_RUN_PIXELS: usize = 1024;
+#[inline]
+fn line_run_pixels<Pixel>(channel_count: usize) -> usize {
+    let element_bytes = std::mem::size_of::<Pixel>().max(1);
+    let passes = channel_count.max(1).saturating_add(1); // per-channel read + write
+    crate::cpu_cache::l1_resident_count(element_bytes, passes)
+}
 
 fn write_decoded_line<PixelStorage: 'static, SetPixel, Pixel: 'static>(
     storage: &mut PixelStorage,
@@ -438,7 +439,7 @@ where
     set_pixel: SetPixel,
     pixel_storage: PixelStorage,
     pixel_reader: PixelReader,
-    /// Converted-pixel scratch reused across blocks (grows to `LINE_RUN_PIXELS`).
+    /// Per-block scratch (grows to L1 run width).
     line_pixels: Vec<PixelReader::RecursivePixel>,
     px: PhantomData<Pixel>,
 }
@@ -465,13 +466,8 @@ where
     fn read_block(&mut self, header: &Header, block: UncompressedBlock) -> UnitResult {
         let line_width = block.index.pixel_size.width();
 
-        // The scratch line is walked once per channel by `read_pixels` and once
-        // more by the write below. A whole 8K line of three halves is 48 KiB --
-        // exactly one L1d -- so each of those passes evicts the one before it.
-        // Working in runs that comfortably fit L1 keeps all of them hot; the
-        // channel planes are addressed from `line_width`, so splitting the line
-        // does not change which bytes are read.
-        let run_width = LINE_RUN_PIXELS.min(line_width);
+        let run_width = line_run_pixels::<PxReader::RecursivePixel>(header.channels.list.len())
+            .min(line_width);
         if self.line_pixels.len() < run_width {
             self.line_pixels.resize(run_width, PxReader::RecursivePixel::default());
         }
@@ -560,18 +556,13 @@ where
         tile.is_largest_resolution_level()
     }
 
-    // Serial fallback, used whenever the caller isn't going through
-    // `read_blocks_in_parallel` (e.g. `.non_parallel()` reads). Identical in
-    // spirit to `SpecificChannelsReader::read_block`, just addressing
-    // `pixel_storage` through `RowMajorPixelStorage::pixels_mut()` (a flat,
-    // row-major buffer) and calling `set_row_pixel(row, x, pixel)` instead of
-    // `set_pixel(storage, position, pixel)`.
     fn read_block(&mut self, header: &Header, block: UncompressedBlock) -> UnitResult {
         let line_width = block.index.pixel_size.width();
-        if self.line_pixels.len() < line_width {
-            self.line_pixels.resize(line_width, PxReader::RecursivePixel::default());
+        let run_width = line_run_pixels::<PxReader::RecursivePixel>(header.channels.list.len())
+            .min(line_width);
+        if self.line_pixels.len() < run_width {
+            self.line_pixels.resize(run_width, PxReader::RecursivePixel::default());
         }
-        let pixels = &mut self.line_pixels[..line_width];
 
         let byte_lines = block
             .data
@@ -585,15 +576,20 @@ where
         let storage_width = self.pixel_storage.width();
         let flat = self.pixel_storage.pixels_mut();
         let x0 = block.index.pixel_position.x();
+        let set_row_pixel = &self.set_row_pixel;
 
         for (y_offset, line_bytes) in byte_lines.enumerate() {
-            self.pixel_reader.read_pixels(line_bytes, line_width, 0, pixels, |px| px);
             let y = block.index.pixel_position.y() + y_offset;
             let row = &mut flat[y * storage_width .. (y + 1) * storage_width];
 
-            for (x_offset, pixel) in pixels.iter().enumerate() {
-                let set_row_pixel = &self.set_row_pixel;
-                set_row_pixel(row, x0 + x_offset, pixel.into_tuple());
+            for x_start in (0..line_width).step_by(run_width) {
+                let run_len = run_width.min(line_width - x_start);
+                let run = &mut self.line_pixels[..run_len];
+                self.pixel_reader
+                    .read_pixels(line_bytes, line_width, x_start, run, |px| px);
+                for (i, pixel) in run.iter().enumerate() {
+                    set_row_pixel(row, x0 + x_start + i, pixel.into_tuple());
+                }
             }
         }
 
@@ -717,10 +713,7 @@ where
                         .and_then(|block| {
                             let mut pixels = vec![PxReader::RecursivePixel::default(); width];
 
-                            // Scanline bands are always full image width starting at x=0.
-                            // (Tried the same L1-resident run tiling as the serial path
-                            // here; at 8 threads workers are bandwidth-bound so the extra
-                            // loop is pure overhead)
+                            // Full-width band (x=0). Run tiling on workers regressed at 8T.
                             for (y_offset, line_bytes) in
                                 block.data.chunks_exact(bytes_per_pixel * width).enumerate()
                             {
