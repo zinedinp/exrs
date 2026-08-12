@@ -56,11 +56,17 @@ pub fn cap_name() -> &'static str {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod x86 {
-    use super::{cap, Tier};
+    use super::{Tier, cap};
     use pulp::core_arch::x86::F16c;
-    use pulp::x86::{V1, V2, V3, V4};
+    use pulp::x86::{V1, V3, V4};
 
     /// `V1::try_new()`, unless the process is capped below the SSE tier.
+    ///
+    /// Still pulp - only [`super::super::dwa::color_space_conversion`],
+    /// [`super::super::dwa::discrete_cosine_transform`], and
+    /// [`super::super::dwa::lossy_dct`] use this rung; `optimize_bytes` was
+    /// ported to miraculix's [`miraculix_x86::sse2`]/[`miraculix_x86::ssse3`]
+    /// below (see `notes/miraculix/TODO.md`).
     #[inline(always)]
     pub(crate) fn v1() -> Option<V1> {
         if cap() >= Tier::Sse {
@@ -70,17 +76,8 @@ pub(crate) mod x86 {
         }
     }
 
-    /// `V2::try_new()`, unless the process is capped below the SSE tier.
-    #[inline(always)]
-    pub(crate) fn v2() -> Option<V2> {
-        if cap() >= Tier::Sse {
-            V2::try_new()
-        } else {
-            None
-        }
-    }
-
     /// `V3::try_new()`, unless the process is capped below the AVX2 tier.
+    /// Still pulp, see [`v1`]'s doc.
     #[inline(always)]
     pub(crate) fn v3() -> Option<V3> {
         if cap() >= Tier::Avx2 {
@@ -91,6 +88,7 @@ pub(crate) mod x86 {
     }
 
     /// `V4::try_new()`, unless the process is capped below the AVX-512 tier.
+    /// Still pulp, see [`v1`]'s doc.
     #[inline(always)]
     pub(crate) fn v4() -> Option<V4> {
         if cap() >= Tier::Avx512 {
@@ -102,13 +100,78 @@ pub(crate) mod x86 {
 
     /// `F16c::try_new()`. Capped with `V3` rather than on its own: exrs never
     /// uses F16C without an accompanying `V3` token, so letting it survive into
-    /// the SSE tier would describe a configuration the crate cannot actually run.
+    /// the SSE tier would describe a configuration the crate cannot actually
+    /// run. Still pulp, see [`v1`]'s doc.
     #[inline(always)]
     pub(crate) fn f16c() -> Option<F16c> {
         if cap() >= Tier::Avx2 {
             F16c::try_new()
         } else {
             None
+        }
+    }
+
+    pub(crate) mod miraculix_x86 {
+        use miraculix::x86::detect_features;
+        use miraculix::x86::ops::avx::avx2::Avx2;
+        use miraculix::x86::ops::avx512::avx512bw::Avx512Bw;
+        use miraculix::x86::ops::avx512::avx512f::Avx512f;
+        use miraculix::x86::ops::sse::sse2::Sse2;
+        use miraculix::x86::ops::sse::ssse3::Ssse3;
+
+        use super::super::{Tier, cap};
+
+        /// SSE2 baseline token, unless the process is capped below the SSE
+        /// tier. Pairs with [`ssse3`] for the SSE-tier kernels.
+        #[inline(always)]
+        pub(crate) fn sse2() -> Option<Sse2> {
+            if cap() >= Tier::Sse {
+                Sse2::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// SSSE3 token, unless the process is capped below the SSE tier.
+        #[inline(always)]
+        pub(crate) fn ssse3() -> Option<Ssse3> {
+            if cap() >= Tier::Sse {
+                Ssse3::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// AVX2 token, unless the process is capped below the AVX2 tier.
+        #[inline(always)]
+        pub(crate) fn avx2() -> Option<Avx2> {
+            if cap() >= Tier::Avx2 {
+                Avx2::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// AVX-512F token, unless the process is capped below the AVX-512
+        /// tier. Pairs with [`avx512bw`] for the AVX-512-tier kernels.
+        #[inline(always)]
+        pub(crate) fn avx512f() -> Option<Avx512f> {
+            if cap() >= Tier::Avx512 {
+                Avx512f::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// AVX-512BW token, unless the process is capped below the AVX-512
+        /// tier.
+        #[inline(always)]
+        pub(crate) fn avx512bw() -> Option<Avx512Bw> {
+            if cap() >= Tier::Avx512 {
+                Avx512Bw::from_features(detect_features())
+            } else {
+                None
+            }
         }
     }
 }

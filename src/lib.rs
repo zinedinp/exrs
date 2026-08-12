@@ -5,15 +5,6 @@
 //! Read __the [GUIDE.md](https://github.com/johannesvollmer/exrs/blob/master/GUIDE.md) for a API introduction__.
 //! Check out the [examples](https://github.com/johannesvollmer/exrs/tree/master/examples) for a first impression.
 
-// 32-bit ARM's `core::arch::arm` NEON types/intrinsics are unstable (unlike
-// aarch64's, which are stable) -- needed directly (not just through pulp's
-// wrapper) by `dwa::lossy_dct::aarch32::neon`'s software f32<->f16 bit-trick.
-// Only active with the (already nightly-only) `arm-neon` feature, so this
-// never affects a stable-toolchain build.
-#![cfg_attr(
-    all(target_arch = "arm", feature = "arm-neon"),
-    feature(stdarch_arm_neon_intrinsics)
-)]
 #![warn(
     rust_2018_idioms,
     future_incompatible,
@@ -70,7 +61,7 @@ pub mod prelude {
                 read,
                 specific_channels::ReadSpecificChannel,
             },
-            write::{channels::GetPixel, WritableImage},
+            write::{WritableImage, channels::GetPixel},
         };
 
         pub use crate::image::read::specific_channels::{
@@ -104,13 +95,12 @@ pub mod prelude {
         block::samples::Sample,
         image::*,
         meta::{
-            attribute,
+            MetaData, attribute,
             attribute::{
                 AttributeValue, ChannelDescription, Compression, IntegerBounds, LineOrder,
                 SampleType, Text, TileDescription,
             },
             header::{ImageAttributes, LayerAttributes},
-            MetaData,
         },
     };
 }

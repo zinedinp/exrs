@@ -6,14 +6,6 @@
 #[doc(hidden)]
 pub mod x86;
 
-#[cfg(target_arch = "aarch64")]
-#[doc(hidden)]
-pub mod aarch64;
-
-#[cfg(target_arch = "arm")]
-#[doc(hidden)]
-pub mod aarch32;
-
 // public only for benchmarking (benches reach `test::pseudo_random_triplets`)
 #[cfg(any(test, feature = "simd-benches"))]
 #[doc(hidden)]
@@ -77,14 +69,6 @@ pub(crate) fn csc709_forward_8x8_batch<'a>(
     if x86::try_csc709_forward_8x8_batch(&mut blocks) {
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    if aarch64::try_csc709_forward_8x8_batch(&mut blocks) {
-        return;
-    }
-    #[cfg(target_arch = "arm")]
-    if aarch32::try_csc709_forward_8x8_batch(&mut blocks) {
-        return;
-    }
 
     for block in blocks {
         csc709_forward_8x8_autovectorized(block);
@@ -99,14 +83,6 @@ pub(crate) fn csc709_inverse_8x8_batch<'a>(
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if x86::try_csc709_inverse_8x8_batch(&mut blocks) {
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if aarch64::try_csc709_inverse_8x8_batch(&mut blocks) {
-        return;
-    }
-    #[cfg(target_arch = "arm")]
-    if aarch32::try_csc709_inverse_8x8_batch(&mut blocks) {
         return;
     }
 

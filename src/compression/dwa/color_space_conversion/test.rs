@@ -91,9 +91,7 @@ mod avx512_tests {
 
     /// Compares the AVX-512 2-blocks-per-register kernel against the scalar
     /// reference applied to each block independently.
-    fn assert_pairs_match(
-        kernel: impl Fn(&mut [[f32; 64]; 3], &mut [[f32; 64]; 3]),
-    ) {
+    fn assert_pairs_match(kernel: impl Fn(&mut [[f32; 64]; 3], &mut [[f32; 64]; 3])) {
         for pair in pseudo_random_triplets(4096).chunks_exact(2) {
             let mut expected_a = pair[0];
             let mut expected_b = pair[1];
@@ -154,64 +152,6 @@ mod sse2_tests {
     fn expect_sse2_without_avx2() -> V1 {
         assert!(V3::try_new().is_none(), "SSE2 dispatch fallback test must run with AVX2 hidden");
         expect_sse2()
-    }
-}
-
-// aarch64 NEON tier correctness tests.
-#[cfg(all(test, target_arch = "aarch64"))]
-mod aarch64_tests {
-    use pulp::aarch64::Neon;
-
-    use super::{
-        super::{aarch64::neon, csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized},
-        assert_blocks_match,
-    };
-
-    #[test]
-    fn neon_forward_matches_autovectorized() {
-        assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            neon::csc709_forward_8x8(expect_neon(), data)
-        });
-    }
-
-    #[test]
-    fn neon_inverse_matches_autovectorized() {
-        assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            neon::csc709_inverse_8x8(expect_neon(), data)
-        });
-    }
-
-    fn expect_neon() -> Neon {
-        Neon::try_new().expect("NEON is baseline on aarch64")
-    }
-}
-
-// 32-bit ARM NEON tier correctness tests. Needs nightly + `arm-neon`.
-#[cfg(all(test, target_arch = "arm", feature = "arm-neon"))]
-mod aarch32_tests {
-    use pulp::aarch32::Neon;
-
-    use super::{
-        super::{aarch32::neon, csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized},
-        assert_blocks_match,
-    };
-
-    #[test]
-    fn neon_forward_matches_autovectorized() {
-        assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            neon::csc709_forward_8x8(expect_neon(), data)
-        });
-    }
-
-    #[test]
-    fn neon_inverse_matches_autovectorized() {
-        assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            neon::csc709_inverse_8x8(expect_neon(), data)
-        });
-    }
-
-    fn expect_neon() -> Neon {
-        Neon::try_new().expect("NEON is baseline on aarch64/most 32-bit ARM hosts")
     }
 }
 

@@ -3,13 +3,8 @@
 //!
 //! OpenEXR's C reference implements the decode-side reconstruct (un-diff) as a
 //! log-depth SIMD prefix sum and interleave as SSE unpack. On x86-64 we ship
-//! reconstruct via `x86/` tiers (`avx512` -> `avx2` -> `sse` -> scalar). On
-//! aarch64 we ship OpenEXR-faithful NEON via `aarch64/`. On 32-bit ARM we ship
-//! the same 16-byte algorithm via `aarch32/`: default [`portable_wide16`] (stable),
-//! or real NEON with feature `arm-neon` + nightly (local pulp `pulp::aarch32::Neon`).
-//!
-//! **Arm paths were not tested on real ARM hardware in this tree** — see
-//! [`aarch64`] / [`aarch32`].
+//! reconstruct via `x86/` tiers (`avx512` -> `avx2` -> `sse` -> scalar).
+//! Non-x86 architectures fall back to [`portable_wide16`].
 
 /// x86 reconstruct tiers (`sse`, `avx2`, `avx512`) + dispatch. `doc(hidden)`-public
 /// so stage benches can call kernels directly, same pattern as DWA DCT.
@@ -17,41 +12,25 @@
 #[doc(hidden)]
 pub mod x86;
 
-/// aarch64 NEON reconstruct + dispatch. `doc(hidden)`-public for stage benches /
-/// correctness tests. **Not tested on real ARM/NEON hardware** (cross-compile /
-/// unit tests only).
-#[cfg(target_arch = "aarch64")]
-#[doc(hidden)]
-pub mod aarch64;
-
-/// 32-bit ARM reconstruct dispatch: `arm-neon` → pulp Neon, else
-/// [`portable_wide16`]. **Not tested on real 32-bit ARM hardware.**
-#[cfg(target_arch = "arm")]
-#[doc(hidden)]
-pub mod aarch32;
-
-/// Portable OpenEXR 16-byte log-depth reconstruct (pure Rust). Default
-/// production path on 32-bit ARM (stable); aarch64 fallback when Neon is
-/// unavailable; host-tested for bit-exactness.
+/// Portable OpenEXR 16-byte log-depth reconstruct (pure Rust). Production
+/// path on every non-x86 architecture; host-tested for bit-exactness.
 #[doc(hidden)]
 pub mod portable_wide16;
 
 /// Integrate over all differences to the previous value in order to
 /// reconstruct sample values (`sample[i] = sample[i-1] + diff[i] - 128`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn differences_to_samples(buffer: &mut [u8]) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if x86::try_differences_to_samples(buffer) {
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    if aarch64::try_differences_to_samples(buffer) {
-        return;
-    }
-    #[cfg(target_arch = "arm")]
-    if aarch32::try_differences_to_samples(buffer) {
-        return;
-    }
     differences_to_samples_scalar(buffer);
+}
+
+/// Non-x86: [`portable_wide16`]'s OpenEXR 16-byte log-depth reconstruct.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn differences_to_samples(buffer: &mut [u8]) {
+    portable_wide16::differences_to_samples(buffer);
 }
 
 /// Derive differences to the previous value (`diff[i] = sample[i] - sample[i-1] + 128`).
@@ -249,9 +228,12 @@ mod test {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn x86_reconstruct_kernels_match_scalar_all_lengths() {
-        let v2 = pulp::x86::V2::try_new();
-        let v3 = pulp::x86::V3::try_new();
-        let v4 = pulp::x86::V4::try_new();
+        use crate::compression::simd_tier::x86::miraculix_x86;
+
+        let sse_tokens = (miraculix_x86::sse2(), miraculix_x86::ssse3());
+        let avx2_token = miraculix_x86::avx2();
+        let avx512_tokens = (miraculix_x86::avx512f(), miraculix_x86::avx512bw());
+
         for len in 0..192 {
             let source: Vec<u8> =
                 (0..len).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
@@ -259,31 +241,33 @@ mod test {
             let mut scalar = source.clone();
             differences_to_samples_scalar(&mut scalar);
 
-            if let Some(v2) = v2 {
+            if let (Some(sse2), Some(ssse3)) = sse_tokens {
                 let mut simd = source.clone();
-                x86::sse::differences_to_samples(v2, &mut simd);
+                x86::sse::differences_to_samples(sse2, ssse3, &mut simd);
                 assert_eq!(scalar, simd, "sse reconstruct len={len}");
             }
-            if let Some(v3) = v3 {
+            if let (Some(avx2), Some(sse2), Some(ssse3)) = (avx2_token, sse_tokens.0, sse_tokens.1) {
                 let mut lane = source.clone();
-                x86::avx2::differences_to_samples_lane(v3, &mut lane);
+                x86::avx2::differences_to_samples_lane(avx2, sse2, ssse3, &mut lane);
                 assert_eq!(scalar, lane, "avx2_lane reconstruct len={len}");
 
                 let mut full = source.clone();
-                x86::avx2::differences_to_samples_full(v3, &mut full);
+                x86::avx2::differences_to_samples_full(avx2, sse2, ssse3, &mut full);
                 assert_eq!(scalar, full, "avx2_full reconstruct len={len}");
 
                 let mut sse_tail = source.clone();
-                x86::avx2::differences_to_samples_lane_sse_tail(v3, &mut sse_tail);
+                x86::avx2::differences_to_samples_lane_sse_tail(avx2, sse2, ssse3, &mut sse_tail);
                 assert_eq!(scalar, sse_tail, "avx2_lane_sse_tail reconstruct len={len}");
             }
-            if let Some(v4) = v4 {
+            if let (Some(f), Some(bw), Some(avx2), Some(sse2), Some(ssse3)) =
+                (avx512_tokens.0, avx512_tokens.1, avx2_token, sse_tokens.0, sse_tokens.1)
+            {
                 let mut lane = source.clone();
-                x86::avx512::differences_to_samples_lane(v4, &mut lane);
+                x86::avx512::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut lane);
                 assert_eq!(scalar, lane, "avx512_lane reconstruct len={len}");
 
                 let mut masked = source.clone();
-                x86::avx512::differences_to_samples_lane_masked(v4, &mut masked);
+                x86::avx512::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut masked);
                 assert_eq!(scalar, masked, "avx512_lane_masked reconstruct len={len}");
             }
         }
@@ -292,6 +276,8 @@ mod test {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn x86_reconstruct_kernels_match_scalar_large() {
+        use crate::compression::simd_tier::x86::miraculix_x86;
+
         let len = 64 * 1024 + 17;
         let source: Vec<u8> =
             (0..len).map(|i| ((i * 131) as u8).wrapping_add((i >> 8) as u8)).collect();
@@ -299,38 +285,40 @@ mod test {
         let mut scalar = source.clone();
         differences_to_samples_scalar(&mut scalar);
 
-        if let Some(v2) = pulp::x86::V2::try_new() {
+        if let (Some(sse2), Some(ssse3)) = (miraculix_x86::sse2(), miraculix_x86::ssse3()) {
             let mut a = source.clone();
-            x86::sse::differences_to_samples(v2, &mut a);
+            x86::sse::differences_to_samples(sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "sse large");
         }
-        if let Some(v3) = pulp::x86::V3::try_new() {
+        if let (Some(avx2), Some(sse2), Some(ssse3)) =
+            (miraculix_x86::avx2(), miraculix_x86::sse2(), miraculix_x86::ssse3())
+        {
             let mut a = source.clone();
-            x86::avx2::differences_to_samples_lane(v3, &mut a);
+            x86::avx2::differences_to_samples_lane(avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx2_lane large");
             let mut a = source.clone();
-            x86::avx2::differences_to_samples_full(v3, &mut a);
+            x86::avx2::differences_to_samples_full(avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx2_full large");
             let mut a = source.clone();
-            x86::avx2::differences_to_samples_lane_sse_tail(v3, &mut a);
+            x86::avx2::differences_to_samples_lane_sse_tail(avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx2_lane_sse_tail large");
         }
-        if let Some(v4) = pulp::x86::V4::try_new() {
+        if let (Some(f), Some(bw), Some(avx2), Some(sse2), Some(ssse3)) = (
+            miraculix_x86::avx512f(),
+            miraculix_x86::avx512bw(),
+            miraculix_x86::avx2(),
+            miraculix_x86::sse2(),
+            miraculix_x86::ssse3(),
+        ) {
             let mut a = source.clone();
-            x86::avx512::differences_to_samples_lane(v4, &mut a);
+            x86::avx512::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx512_lane large");
             let mut a = source.clone();
-            x86::avx512::differences_to_samples_lane_masked(v4, &mut a);
+            x86::avx512::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx512_lane_masked large");
         }
     }
 
-    #[cfg(any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "arm"
-    ))]
     #[test]
     fn production_dispatch_matches_scalar() {
         for &len in &[0usize, 1, 15, 16, 17, 31, 32, 33, 64, 1000, 4096 + 3] {
@@ -344,7 +332,7 @@ mod test {
         }
     }
 
-    /// Portable 16-byte OpenEXR tree (32-bit ARM production kernel) — host-tested.
+    /// Portable 16-byte OpenEXR tree (non-x86 production kernel) — host-tested.
     #[test]
     fn portable_wide16_matches_scalar_all_lengths() {
         for len in 0..192 {
@@ -368,85 +356,5 @@ mod test {
         differences_to_samples_scalar(&mut scalar);
         portable_wide16::differences_to_samples(&mut wide);
         assert_eq!(scalar, wide, "portable_wide16 large");
-    }
-
-    /// NEON reconstruct must match scalar on every length (incl. 16-byte rem).
-    ///
-    /// **Not run on real ARM hardware in this tree** unless CI/qemu is set up;
-    /// the kernel is the OpenEXR NEON algorithm ported through pulp.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn aarch64_neon_reconstruct_matches_scalar_all_lengths() {
-        let neon = pulp::aarch64::Neon::try_new();
-        for len in 0..192 {
-            let source: Vec<u8> =
-                (0..len).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
-
-            let mut scalar = source.clone();
-            differences_to_samples_scalar(&mut scalar);
-
-            if let Some(simd) = neon {
-                let mut simd_buf = source.clone();
-                aarch64::neon::differences_to_samples(simd, &mut simd_buf);
-                assert_eq!(scalar, simd_buf, "neon reconstruct len={len}");
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn aarch64_neon_reconstruct_matches_scalar_large() {
-        let len = 64 * 1024 + 17;
-        let source: Vec<u8> =
-            (0..len).map(|i| ((i * 131) as u8).wrapping_add((i >> 8) as u8)).collect();
-
-        let mut scalar = source.clone();
-        differences_to_samples_scalar(&mut scalar);
-
-        if let Some(simd) = pulp::aarch64::Neon::try_new() {
-            let mut a = source.clone();
-            aarch64::neon::differences_to_samples(simd, &mut a);
-            assert_eq!(scalar, a, "neon large");
-        }
-    }
-
-    /// 32-bit ARM NEON reconstruct (feature `arm-neon` + nightly).
-    ///
-    /// **Not run on real 32-bit ARM hardware in this tree** unless CI/qemu is
-    /// set up. Cross-compile + qemu-user can exercise this path.
-    #[cfg(all(target_arch = "arm", feature = "arm-neon"))]
-    #[test]
-    fn arm_neon_reconstruct_matches_scalar_all_lengths() {
-        let neon = pulp::aarch32::Neon::try_new();
-        for len in 0..192 {
-            let source: Vec<u8> =
-                (0..len).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
-
-            let mut scalar = source.clone();
-            differences_to_samples_scalar(&mut scalar);
-
-            if let Some(simd) = neon {
-                let mut simd_buf = source.clone();
-                aarch32::neon::differences_to_samples(simd, &mut simd_buf);
-                assert_eq!(scalar, simd_buf, "arm neon reconstruct len={len}");
-            }
-        }
-    }
-
-    #[cfg(all(target_arch = "arm", feature = "arm-neon"))]
-    #[test]
-    fn arm_neon_reconstruct_matches_scalar_large() {
-        let len = 64 * 1024 + 17;
-        let source: Vec<u8> =
-            (0..len).map(|i| ((i * 131) as u8).wrapping_add((i >> 8) as u8)).collect();
-
-        let mut scalar = source.clone();
-        differences_to_samples_scalar(&mut scalar);
-
-        if let Some(simd) = pulp::aarch32::Neon::try_new() {
-            let mut a = source.clone();
-            aarch32::neon::differences_to_samples(simd, &mut a);
-            assert_eq!(scalar, a, "arm neon large");
-        }
     }
 }

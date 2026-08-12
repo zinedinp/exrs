@@ -182,10 +182,8 @@ mod avx512_tests {
     #[test]
     fn avx512_rgb_component_quad_matches_seq() {
         let blocks = pseudo_random_blocks(4096 * 6);
-        let mut pairs: Vec<avx512::RgbPairBlocks> = blocks
-            .chunks_exact(6)
-            .map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]]))
-            .collect();
+        let mut pairs: Vec<avx512::RgbPairBlocks> =
+            blocks.chunks_exact(6).map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]])).collect();
         let mut expected = pairs.clone();
 
         avx512::dct_inverse_rgb_pair_components_seq(expect_avx512(), &mut expected);
@@ -237,64 +235,6 @@ mod sse2_tests {
     fn expect_sse2_without_avx2() -> V1 {
         assert!(V3::try_new().is_none(), "SSE2 dispatch fallback test must run with AVX2 hidden");
         expect_sse2()
-    }
-}
-
-// aarch64 NEON tier correctness tests.
-#[cfg(all(test, target_arch = "aarch64"))]
-mod aarch64_tests {
-    use pulp::aarch64::Neon;
-
-    use super::{
-        super::{aarch64::neon, dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized},
-        assert_blocks_match,
-    };
-
-    #[test]
-    fn neon_inverse_close_to_autovectorized_reference() {
-        assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
-            neon::dct_inverse_8x8(expect_neon(), data)
-        });
-    }
-
-    #[test]
-    fn neon_forward_close_to_autovectorized_reference() {
-        assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
-            neon::dct_forward_8x8(expect_neon(), data)
-        });
-    }
-
-    fn expect_neon() -> Neon {
-        Neon::try_new().expect("NEON is baseline on aarch64")
-    }
-}
-
-// 32-bit ARM NEON tier correctness tests. Needs nightly + `arm-neon`.
-#[cfg(all(test, target_arch = "arm", feature = "arm-neon"))]
-mod aarch32_tests {
-    use pulp::aarch32::Neon;
-
-    use super::{
-        super::{aarch32::neon, dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized},
-        assert_blocks_match,
-    };
-
-    #[test]
-    fn neon_inverse_close_to_autovectorized_reference() {
-        assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
-            neon::dct_inverse_8x8(expect_neon(), data)
-        });
-    }
-
-    #[test]
-    fn neon_forward_close_to_autovectorized_reference() {
-        assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
-            neon::dct_forward_8x8(expect_neon(), data)
-        });
-    }
-
-    fn expect_neon() -> Neon {
-        Neon::try_new().expect("NEON is baseline on aarch64/most 32-bit ARM hosts")
     }
 }
 

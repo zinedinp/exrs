@@ -19,14 +19,6 @@
 #[doc(hidden)]
 pub mod x86;
 
-#[cfg(target_arch = "aarch64")]
-#[doc(hidden)]
-pub mod aarch64;
-
-#[cfg(target_arch = "arm")]
-#[doc(hidden)]
-pub mod aarch32;
-
 // public only for benchmarking (benches/dct.rs reaches
 // `test::pseudo_random_blocks`)
 #[cfg(any(test, feature = "simd-benches"))]
@@ -185,14 +177,6 @@ pub(crate) fn dct_forward_8x8_batch<'a>(mut blocks: impl Iterator<Item = &'a mut
     if x86::try_dct_forward_8x8_batch(&mut blocks) {
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    if aarch64::try_dct_forward_8x8_batch(&mut blocks) {
-        return;
-    }
-    #[cfg(target_arch = "arm")]
-    if aarch32::try_dct_forward_8x8_batch(&mut blocks) {
-        return;
-    }
 
     for data in blocks {
         dct_forward_8x8_autovectorized(data);
@@ -207,14 +191,6 @@ pub(crate) fn dct_inverse_8x8_batch<'a>(mut blocks: impl Iterator<Item = &'a mut
     if x86::try_dct_inverse_8x8_batch(&mut blocks) {
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    if aarch64::try_dct_inverse_8x8_batch(&mut blocks) {
-        return;
-    }
-    #[cfg(target_arch = "arm")]
-    if aarch32::try_dct_inverse_8x8_batch(&mut blocks) {
-        return;
-    }
 
     for data in blocks {
         dct_inverse_8x8_autovectorized(data);
@@ -223,8 +199,7 @@ pub(crate) fn dct_inverse_8x8_batch<'a>(mut blocks: impl Iterator<Item = &'a mut
 
 /// Forward-DCT basis table (cosine coefficients), shared by every SIMD tier
 /// across every architecture -- purely data, no architecture-specific shape.
-/// Unused (dead) on 32-bit ARM builds without the `arm-neon` feature, where
-/// no SIMD tier is available at all.
+/// Unused (dead) on non-x86 builds, where no SIMD tier is available at all.
 #[allow(dead_code)]
 pub(crate) fn forward_basis() -> &'static [[f32; 8]; 8] {
     use std::sync::OnceLock;

@@ -10,7 +10,7 @@ use std::convert::TryInto;
 
 use half::f16;
 
-use super::{color_space_conversion, discrete_cosine_transform, ChannelInfo, CompressorScheme};
+use super::{ChannelInfo, CompressorScheme, color_space_conversion, discrete_cosine_transform};
 use crate::{
     error::{Error, Result},
     meta::attribute::SampleType,
@@ -24,19 +24,8 @@ mod transfer_curve;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
-// Write-row NEON acceleration; the DCT/CSC stages already dispatch to NEON
-// generically (see `discrete_cosine_transform`/`color_space_conversion`).
-// Cross-compile-checked and unit-tested only -- no ARM hardware/emulator on
-// this dev machine. See `aarch64::neon`'s module docs.
-#[cfg(target_arch = "aarch64")]
-mod aarch64;
-
-// Same as `aarch64` above, for 32-bit ARM (needs nightly + `arm-neon`).
-#[cfg(target_arch = "arm")]
-mod aarch32;
-
 use ac_rle::{rle_ac, un_rle_ac};
-use quantization::{from_half_zigzag, quantize_coefficients_to_zigzag, QuantTables};
+use quantization::{QuantTables, from_half_zigzag, quantize_coefficients_to_zigzag};
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
 pub(super) fn encode_lossy_channels(
@@ -314,7 +303,10 @@ pub(super) fn decode_lossy_channels(
         let info = &infos[group[0]];
         let mut targets: [ScanlineTarget<'_>; 3] = std::array::from_fn(|i| {
             let channel = group[i];
-            ScanlineTarget { sample_type: infos[channel].sample_type, row_offsets: &row_offsets[channel] }
+            ScanlineTarget {
+                sample_type: infos[channel].sample_type,
+                row_offsets: &row_offsets[channel],
+            }
         });
 
         decode_lossy_dct_group(
@@ -336,10 +328,20 @@ pub(super) fn decode_lossy_channels(
         if grouped[index] || info.scheme != CompressorScheme::LossyDct {
             continue;
         }
-        let mut targets =
-            [ScanlineTarget { sample_type: info.sample_type, row_offsets: &row_offsets[index] }];
+        let mut targets = [ScanlineTarget {
+            sample_type: info.sample_type,
+            row_offsets: &row_offsets[index],
+        }];
         let to_linear = (!info.quantize_linearly).then(to_linear_table);
-        decode_lossy_dct_group(&mut ac, &mut dc, info.width, info.height, to_linear, &mut targets, out)?;
+        decode_lossy_dct_group(
+            &mut ac,
+            &mut dc,
+            info.width,
+            info.height,
+            to_linear,
+            &mut targets,
+            out,
+        )?;
     }
 
     Ok(())
@@ -528,50 +530,25 @@ fn decode_lossy_dct_group(
                                             continue;
                                         }
                                     }
-                                    #[cfg(target_arch = "aarch64")]
-                                    {
-                                        let handled = match target.sample_type {
-                                            SampleType::F16 => {
-                                                aarch64::try_write_row_f16(row, to_linear, out_row)
-                                            }
-                                            SampleType::F32 => {
-                                                aarch64::try_write_row_f32(row, to_linear, out_row)
-                                            }
-                                            SampleType::U32 => false,
-                                        };
-                                        if handled {
-                                            continue;
-                                        }
-                                    }
-                                    #[cfg(target_arch = "arm")]
-                                    {
-                                        let handled = match target.sample_type {
-                                            SampleType::F16 => {
-                                                aarch32::try_write_row_f16(row, to_linear, out_row)
-                                            }
-                                            SampleType::F32 => {
-                                                aarch32::try_write_row_f32(row, to_linear, out_row)
-                                            }
-                                            SampleType::U32 => false,
-                                        };
-                                        if handled {
-                                            continue;
-                                        }
-                                    }
-
                                     match target.sample_type {
                                         SampleType::F16 => {
-                                            for (chunk, &value) in out_row.chunks_exact_mut(2).zip(row)
+                                            for (chunk, &value) in
+                                                out_row.chunks_exact_mut(2).zip(row)
                                             {
                                                 let linear: f16 = $linearize(value);
-                                                chunk.copy_from_slice(&linear.to_bits().to_le_bytes());
+                                                chunk.copy_from_slice(
+                                                    &linear.to_bits().to_le_bytes(),
+                                                );
                                             }
                                         }
                                         SampleType::F32 => {
-                                            for (chunk, &value) in out_row.chunks_exact_mut(4).zip(row)
+                                            for (chunk, &value) in
+                                                out_row.chunks_exact_mut(4).zip(row)
                                             {
                                                 let linear: f16 = $linearize(value);
-                                                chunk.copy_from_slice(&linear.to_f32().to_le_bytes());
+                                                chunk.copy_from_slice(
+                                                    &linear.to_f32().to_le_bytes(),
+                                                );
                                             }
                                         }
                                         // rejected before decoding

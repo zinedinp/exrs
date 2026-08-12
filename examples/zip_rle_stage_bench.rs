@@ -13,6 +13,14 @@ use exr::compression::optimize_bytes::{
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use exr::compression::optimize_bytes::x86::{avx2, avx512, sse};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::detect_features;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::avx::avx2::Avx2;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::avx512::{avx512bw::Avx512Bw, avx512f::Avx512f};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::sse::{sse2::Sse2, ssse3::Ssse3};
 
 fn gbs(n: usize, secs: f64) -> f64 {
     (n as f64 / secs) / 1e9
@@ -41,14 +49,24 @@ fn main() {
     );
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let (v2, v3, v4) = (
-        pulp::x86::V2::try_new(),
-        pulp::x86::V3::try_new(),
-        pulp::x86::V4::try_new(),
+    let features = detect_features();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let (sse2, ssse3, avx2_token, avx512f, avx512bw) = (
+        Sse2::from_features(features),
+        Ssse3::from_features(features),
+        Avx2::from_features(features),
+        Avx512f::from_features(features),
+        Avx512Bw::from_features(features),
     );
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let v2 = sse2.zip(ssse3);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let v3 = avx2_token.zip(sse2).zip(ssse3).map(|((a, s), t)| (a, s, t));
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let v4 = avx512f.zip(avx512bw).zip(v3).map(|((f, bw), (a, s, t))| (f, bw, a, s, t));
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     println!(
-        "CPU tokens: V2(SSE)={}  V3(AVX2)={}  V4(AVX512)={}\n",
+        "CPU tokens: SSE={}  AVX2={}  AVX512={}\n",
         v2.is_some(),
         v3.is_some(),
         v4.is_some()
@@ -71,23 +89,38 @@ fn main() {
         let pred_dispatch = time_recon(n, reps, &base, |b| differences_to_samples(b));
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_sse = v2.map(|v| time_recon(n, reps, &base, |b| sse::differences_to_samples(v, b)));
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_lane =
-            v3.map(|v| time_recon(n, reps, &base, |b| avx2::differences_to_samples_lane(v, b)));
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_sse_tail = v3.map(|v| {
-            time_recon(n, reps, &base, |b| avx2::differences_to_samples_lane_sse_tail(v, b))
+        let pred_sse = v2.map(|(sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| sse::differences_to_samples(sse2, ssse3, b))
         });
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_full =
-            v3.map(|v| time_recon(n, reps, &base, |b| avx2::differences_to_samples_full(v, b)));
+        let pred_lane = v3.map(|(avx2_t, sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| {
+                avx2::differences_to_samples_lane(avx2_t, sse2, ssse3, b)
+            })
+        });
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_avx512 =
-            v4.map(|v| time_recon(n, reps, &base, |b| avx512::differences_to_samples_lane(v, b)));
+        let pred_sse_tail = v3.map(|(avx2_t, sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| {
+                avx2::differences_to_samples_lane_sse_tail(avx2_t, sse2, ssse3, b)
+            })
+        });
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let pred_avx512_m = v4.map(|v| {
-            time_recon(n, reps, &base, |b| avx512::differences_to_samples_lane_masked(v, b))
+        let pred_full = v3.map(|(avx2_t, sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| {
+                avx2::differences_to_samples_full(avx2_t, sse2, ssse3, b)
+            })
+        });
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let pred_avx512 = v4.map(|(f, bw, avx2_t, sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| {
+                avx512::differences_to_samples_lane(f, bw, avx2_t, sse2, ssse3, b)
+            })
+        });
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let pred_avx512_m = v4.map(|(f, bw, avx2_t, sse2, ssse3)| {
+            time_recon(n, reps, &base, |b| {
+                avx512::differences_to_samples_lane_masked(f, bw, avx2_t, sse2, ssse3, b)
+            })
         });
 
         // Encode predictor + interleave still scalar-only (regression ports commented).
@@ -152,15 +185,8 @@ fn main() {
         }
         let sep_prod = t.elapsed().as_secs_f64() / ireps as f64;
 
-        println!(
-            "n={:>8} ({:>7.1} KiB)  reps={reps}",
-            n,
-            n as f64 / 1024.0
-        );
-        println!(
-            "  reconstruct  scalar       {:5.1} GB/s",
-            gbs(n, pred_scalar)
-        );
+        println!("n={:>8} ({:>7.1} KiB)  reps={reps}", n, n as f64 / 1024.0);
+        println!("  reconstruct  scalar       {:5.1} GB/s", gbs(n, pred_scalar));
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if let Some(t) = pred_sse {

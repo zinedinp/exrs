@@ -12,7 +12,7 @@ repository = "https://github.com/johannesvollmer/exrs"
 readme = "README.md"
 license = "BSD-3-Clause"
 exclude = [ "specification/*", "specification/**", "tests/images/*", "tests/images/**" ]
-rust-version = "1.85.0"
+rust-version = "1.94.0"
 
 [badges]
 maintenance = { status = "actively-developed" }
@@ -33,9 +33,9 @@ flate2 = { version = "^1.1.9", default-features = false, features = ["zlib-rs"] 
 smallvec = "^1.15.2"            # make cache-friendly allocations        TODO profile if smallvec is really an improvement!
 rayon-core = { version = "^1.13.0", optional = true }         # threading for parallel compression
 zune-inflate = { version = "^0.2.54", default-features = false, features = ["zlib"] }  # zip decompression, faster than miniz_oxide
-pulp = { version = "0.22.3", features = ["x86-v4"] }   # used for runtime SIMD dispatch; x86-v4 = AVX-512 tier
+pulp = { version = "0.22.3", features = ["x86-v4"] }   # runtime SIMD dispatch for the codecs not yet ported to miraculix (CSC, DCT, lossy_dct); removed once those land too
 num-complex = "0.4.6"          # pins pulps own dependency, pulp wants 0.4.4 but calls for Complex::ZERO/ONE/I; consts added in 0.4.6
-
+miraculix = { path = "../miraculix" }   # x86 SIMD wrapper crate
 [dev-dependencies]
 bencher = "0.1.5"
 walkdir = "2.3.2"         # automatically test things for all files in a directory
@@ -73,13 +73,6 @@ dwa-profile = []
 # compression codecs dispatch to, so one binary can be swept across all four
 # tiers on the same host
 simd-tier-env = []
-
-# 32-bit ARM NEON reconstruct via pulp's nightly Neon token.
-# Requires a nightly toolchain + pulp `nightly` (stdarch arm NEON is unstable).
-# Example:
-#   cargo +nightly check --target armv7-unknown-linux-gnueabihf --features arm-neon
-# Without this feature, 32-bit ARM uses portable_wide16 (stable-safe).
-arm-neon = ["pulp/nightly"]
 
 # Opt-in Zen5 component dual-port DCT inside AVX-512 fused decode
 # (`inverse_quad(R∥G)` + pair B instead of 3× sequential `inverse_pair`).

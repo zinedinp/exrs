@@ -19,14 +19,19 @@ use exr::compression::optimize_bytes::{differences_to_samples, differences_to_sa
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use exr::compression::optimize_bytes::x86::{avx2, avx512, sse};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::detect_features;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::avx::avx2::Avx2;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::avx512::{avx512bw::Avx512Bw, avx512f::Avx512f};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use miraculix::x86::ops::sse::{sse2::Sse2, ssse3::Ssse3};
 
 fn main() {
     let mut args = env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "dispatch".into());
-    let nbytes: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4 * 1024 * 1024);
+    let nbytes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4 * 1024 * 1024);
     let reps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(64);
 
     // Pseudo-random diffs so the integrate chain is not all zeros (keeps deps live).
@@ -55,55 +60,70 @@ fn main() {
         "sse" | "simd" => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                if let Some(v2) = pulp::x86::V2::try_new() {
+                let features = detect_features();
+                if let (Some(sse2), Some(ssse3)) =
+                    (Sse2::from_features(features), Ssse3::from_features(features))
+                {
                     for i in 0..reps {
                         if i % 4 == 0 {
                             buf.copy_from_slice(&base);
                         }
-                        sse::differences_to_samples(v2, &mut buf);
+                        sse::differences_to_samples(sse2, ssse3, &mut buf);
                         black_box(&buf);
                     }
                     finish(&mode, nbytes, reps, &buf);
                     return;
                 }
             }
-            eprintln!("V2 unavailable; falling back to dispatch");
+            eprintln!("SSE2/SSSE3 unavailable; falling back to dispatch");
             run_dispatch(&mut buf, &base, reps);
         }
         "avx2" => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                if let Some(v3) = pulp::x86::V3::try_new() {
+                let features = detect_features();
+                if let (Some(avx2_t), Some(sse2), Some(ssse3)) = (
+                    Avx2::from_features(features),
+                    Sse2::from_features(features),
+                    Ssse3::from_features(features),
+                ) {
                     for i in 0..reps {
                         if i % 4 == 0 {
                             buf.copy_from_slice(&base);
                         }
-                        avx2::differences_to_samples(v3, &mut buf);
+                        avx2::differences_to_samples(avx2_t, sse2, ssse3, &mut buf);
                         black_box(&buf);
                     }
                     finish(&mode, nbytes, reps, &buf);
                     return;
                 }
             }
-            eprintln!("V3 unavailable; falling back to dispatch");
+            eprintln!("AVX2 unavailable; falling back to dispatch");
             run_dispatch(&mut buf, &base, reps);
         }
         "avx512" => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
-                if let Some(v4) = pulp::x86::V4::try_new() {
+                let features = detect_features();
+                if let (Some(f), Some(bw), Some(avx2_t), Some(sse2), Some(ssse3)) = (
+                    Avx512f::from_features(features),
+                    Avx512Bw::from_features(features),
+                    Avx2::from_features(features),
+                    Sse2::from_features(features),
+                    Ssse3::from_features(features),
+                ) {
                     for i in 0..reps {
                         if i % 4 == 0 {
                             buf.copy_from_slice(&base);
                         }
-                        avx512::differences_to_samples(v4, &mut buf);
+                        avx512::differences_to_samples(f, bw, avx2_t, sse2, ssse3, &mut buf);
                         black_box(&buf);
                     }
                     finish(&mode, nbytes, reps, &buf);
                     return;
                 }
             }
-            eprintln!("V4 unavailable; falling back to dispatch");
+            eprintln!("AVX-512 unavailable; falling back to dispatch");
             run_dispatch(&mut buf, &base, reps);
         }
         "dispatch" => {

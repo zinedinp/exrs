@@ -6,14 +6,10 @@
 use super::PackedStream;
 use crate::error::{Error, Result};
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(super) mod x86;
-
 /// `position` starts at 1 and increases by at least 1 per token (a run of 0
 /// maps to +64, ending the loop immediately), so one block never reads more
 /// than 63 tokens -- the threshold `un_rle_ac` checks up front to take its
-/// branchless fast path. Shared with `x86`'s experimental kernels so the
-/// magic number lives in exactly one place.
+/// branchless fast path.
 pub(super) const MAX_TOKENS_PER_BLOCK: usize = 63;
 
 pub(super) fn rle_ac(block: &[u16; 64], ac: &mut Vec<u16>) {

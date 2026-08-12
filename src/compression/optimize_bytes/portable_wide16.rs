@@ -1,9 +1,7 @@
 //! Portable 16-byte OpenEXR log-depth `reconstruct`.
 //!
-//! Same algorithm as x86 SSE (`_mm_slli_si128` + `paddb`) and aarch64 NEON
-//! (`vextq_u8` + `vaddq_u8`)
-//!
-//! **Not tested on real 32-bit ARM hardware
+//! Same algorithm as x86 SSE (`_mm_slli_si128` + `paddb`). Production
+//! fallback on every non-x86 architecture.
 
 use std::convert::TryInto;
 
