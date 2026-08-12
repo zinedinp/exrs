@@ -19,7 +19,7 @@ use miraculix::x86::ops::sse::sse2::Sse2;
 use miraculix::x86::ops::sse::ssse3::Ssse3;
 
 use super::avx2 as avx2_mod;
-use super::sse::{to_i8x16, to_u8x16};
+use super::ssse3::{to_i8x16, to_u8x16};
 
 /// Production AVX-512 entry: lane-prefix with hierarchical remainder.
 #[inline]

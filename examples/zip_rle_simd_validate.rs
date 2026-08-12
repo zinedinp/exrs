@@ -18,7 +18,7 @@ use std::hint::black_box;
 use exr::compression::optimize_bytes::{differences_to_samples, differences_to_samples_scalar};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use exr::compression::optimize_bytes::x86::{avx2, avx512, sse};
+use exr::compression::optimize_bytes::x86::{avx2, avx512bw as avx512, ssse3 as sse};
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use miraculix::x86::detect_features;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

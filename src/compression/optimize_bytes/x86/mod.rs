@@ -22,15 +22,19 @@ use crate::compression::simd_tier::x86::miraculix_x86;
 pub mod avx2;
 use self::avx2 as avx2_dispatch;
 
-// public only for benchmarking / correctness tests
+// public only for benchmarking / correctness tests. Named `avx512bw`:
+// `Avx512Bw` is the most restrictive of this file's 5 tokens (byte/word
+// integer ops need BW, not just base `Avx512f`).
 #[doc(hidden)]
-pub mod avx512;
+pub mod avx512bw;
 
-// public only for benchmarking / correctness tests
+// public only for benchmarking / correctness tests. Named `ssse3`, not
+// `sse`: this file's carry-propagation shuffle needs `Ssse3`, not just the
+// base `Sse2` token.
 #[doc(hidden)]
-pub mod sse;
+pub mod ssse3;
 
-/// Below one full 64-byte AVX-512 lane, `avx512::differences_to_samples`
+/// Below one full 64-byte AVX-512 lane, `avx512bw::differences_to_samples`
 /// never fills a chunk: it still pays for the pre-bias store, the empty
 /// `n_chunks` loop, and the undo-bias-then-delegate-to-AVX2 remainder path
 /// (`avx512.rs`'s `finish_hierarchical`, `done == 0` branch). Measured a
@@ -122,7 +126,7 @@ pub(super) fn try_differences_to_samples(buffer: &mut [u8]) -> bool {
             ssse3,
         } => {
             if buffer.len() >= AVX512_MIN_LEN {
-                avx512::differences_to_samples(f, bw, avx2, sse2, ssse3, buffer);
+                avx512bw::differences_to_samples(f, bw, avx2, sse2, ssse3, buffer);
             } else {
                 avx2_dispatch::differences_to_samples(avx2, sse2, ssse3, buffer);
             }
@@ -140,7 +144,7 @@ pub(super) fn try_differences_to_samples(buffer: &mut [u8]) -> bool {
             sse2,
             ssse3,
         } => {
-            sse::differences_to_samples(sse2, ssse3, buffer);
+            self::ssse3::differences_to_samples(sse2, ssse3, buffer);
             true
         }
         Tier::Scalar => false,

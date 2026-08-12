@@ -584,7 +584,7 @@ const fn mod_p(x: i32, y: i32) -> i32 {
 }
 
 /// Byte predictors and half-byte interleave shared by ZIP and RLE.
-/// SIMD on x86-64 (`pulp::x86::V2`); scalar fallback elsewhere.
+/// SIMD on x86-64 (via `miraculix`); scalar fallback elsewhere.
 /// Public only so `examples/zip_rle_stage_bench` can A/B scalar vs SIMD in isolation.
 #[doc(hidden)]
 pub mod optimize_bytes;

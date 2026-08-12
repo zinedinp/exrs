@@ -59,10 +59,11 @@ fn dct_inverse_8x8(data: &mut [f32; 64]) {
 mod avx2_tests {
     use std::path::Path;
 
-    use pulp::x86::V3;
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
 
     use super::{
-        super::{dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized, x86::avx2},
+        super::{dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized, x86::avx},
         assert_blocks_match,
     };
     use crate::{image::validate_results::ValidateResult, prelude::*};
@@ -70,14 +71,14 @@ mod avx2_tests {
     #[test]
     fn avx2_inverse_matches_autovectorized() {
         assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
-            avx2::dct_inverse_8x8(expect_avx2(), data)
+            avx::dct_inverse_8x8(expect_avx2(), data)
         });
     }
 
     #[test]
     fn avx2_forward_matches_autovectorized() {
         assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
-            avx2::dct_forward_8x8(expect_avx2(), data)
+            avx::dct_forward_8x8(expect_avx2(), data)
         });
     }
 
@@ -111,8 +112,9 @@ mod avx2_tests {
         ground_truth.assert_equals_result(&decoded);
     }
 
-    fn expect_avx2() -> V3 {
-        V3::try_new().expect("AVX2 SIMD mode requested, but the AVX2/FMA tier is unavailable")
+    fn expect_avx2() -> Avx {
+        Avx::from_features(detect_features())
+            .expect("AVX SIMD mode requested, but the AVX tier is unavailable")
     }
 }
 
@@ -121,10 +123,13 @@ mod avx2_tests {
 // requires avx512f/bw/cd/dq/vl all present.
 #[cfg(all(test, feature = "avx512-tests"))]
 mod avx512_tests {
-    use pulp::x86::V4;
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
+    use miraculix::x86::ops::avx512::avx512dq::Avx512Dq;
+    use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
     use super::{
-        super::{dct_inverse_8x8_autovectorized, x86::avx512},
+        super::{dct_inverse_8x8_autovectorized, x86::avx512dq as avx512f},
         pseudo_random_blocks,
     };
     use crate::image::validate_results::ValidateResult;
@@ -151,7 +156,8 @@ mod avx512_tests {
 
     #[test]
     fn avx512_inverse_matches_autovectorized() {
-        assert_pairs_match(|a, b| avx512::dct_inverse_8x8_pair(expect_avx512(), a, b));
+        let (avx512f, avx, avx512dq) = expect_avx512();
+        assert_pairs_match(|a, b| avx512f::dct_inverse_8x8_pair(avx512f, avx, avx512dq, a, b));
     }
 
     /// The hand-interleaved 2-pair ("quad") kernel must produce exactly the
@@ -159,17 +165,18 @@ mod avx512_tests {
     /// the two chains' stages is a scheduling change only, not a math change.
     #[test]
     fn avx512_quad_matches_pair() {
+        let (avx512f, avx, avx512dq) = expect_avx512();
         let blocks = pseudo_random_blocks(4096);
         for group in blocks.chunks_exact(4) {
             let mut expected = [group[0], group[1], group[2], group[3]];
             let mut actual = expected;
 
             let [ref mut ea0, ref mut eb0, ref mut ea1, ref mut eb1] = expected;
-            avx512::dct_inverse_8x8_pair(expect_avx512(), ea0, eb0);
-            avx512::dct_inverse_8x8_pair(expect_avx512(), ea1, eb1);
+            avx512f::dct_inverse_8x8_pair(avx512f, avx, avx512dq, ea0, eb0);
+            avx512f::dct_inverse_8x8_pair(avx512f, avx, avx512dq, ea1, eb1);
 
             let [ref mut a0, ref mut b0, ref mut a1, ref mut b1] = actual;
-            avx512::dct_inverse_8x8_quad(expect_avx512(), a0, b0, a1, b1);
+            avx512f::dct_inverse_8x8_quad(avx512f, avx, avx512dq, a0, b0, a1, b1);
 
             for (e, a) in expected.iter().zip(actual.iter()) {
                 e.to_vec().assert_approx_equals_result(&a.to_vec());
@@ -181,13 +188,14 @@ mod avx512_tests {
     /// match three sequential `inverse_pair`s on the same RGB spatial pair.
     #[test]
     fn avx512_rgb_component_quad_matches_seq() {
+        let (avx512f, avx, avx512dq) = expect_avx512();
         let blocks = pseudo_random_blocks(4096 * 6);
-        let mut pairs: Vec<avx512::RgbPairBlocks> =
+        let mut pairs: Vec<avx512f::RgbPairBlocks> =
             blocks.chunks_exact(6).map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]])).collect();
         let mut expected = pairs.clone();
 
-        avx512::dct_inverse_rgb_pair_components_seq(expect_avx512(), &mut expected);
-        avx512::dct_inverse_rgb_pair_components_quad(expect_avx512(), &mut pairs);
+        avx512f::dct_inverse_rgb_pair_components_seq(avx512f, avx, avx512dq, &mut expected);
+        avx512f::dct_inverse_rgb_pair_components_quad(avx512f, avx, avx512dq, &mut pairs);
 
         for (e, a) in expected.iter().zip(pairs.iter()) {
             for c in 0..3 {
@@ -197,8 +205,16 @@ mod avx512_tests {
         }
     }
 
-    fn expect_avx512() -> V4 {
-        V4::try_new().expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
+    fn expect_avx512() -> (Avx512f, Avx, Avx512Dq) {
+        let features = detect_features();
+        (
+            Avx512f::from_features(features)
+                .expect("AVX-512 SIMD mode requested, but the AVX-512F tier is unavailable"),
+            Avx::from_features(features)
+                .expect("AVX-512 SIMD mode requested, but the AVX tier is unavailable"),
+            Avx512Dq::from_features(features)
+                .expect("AVX-512 SIMD mode requested, but the AVX-512DQ tier is unavailable"),
+        )
     }
 }
 
@@ -207,34 +223,40 @@ mod avx512_tests {
 // CPU without AVX2); `expect_sse2_without_avx2` asserts that.
 #[cfg(all(test, feature = "sse2-tests"))]
 mod sse2_tests {
-    use pulp::x86::{V1, V3};
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
+    use miraculix::x86::ops::sse::sse::Sse;
 
     use super::{
-        super::{dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized, x86::sse2},
+        super::{dct_forward_8x8_autovectorized, dct_inverse_8x8_autovectorized, x86::sse},
         assert_blocks_match,
     };
 
     #[test]
     fn assert_sse2_close_to_autovectorized_reference() {
         assert_blocks_match(dct_inverse_8x8_autovectorized, |data| {
-            sse2::dct_inverse_8x8(expect_sse2_without_avx2(), data)
+            sse::dct_inverse_8x8(expect_sse_without_avx(), data)
         });
     }
 
     #[test]
     fn assert_sse2_forward_close_to_autovectorized_reference() {
         assert_blocks_match(dct_forward_8x8_autovectorized, |data| {
-            sse2::dct_forward_8x8(expect_sse2_without_avx2(), data)
+            sse::dct_forward_8x8(expect_sse_without_avx(), data)
         });
     }
 
-    fn expect_sse2() -> V1 {
-        V1::try_new().expect("SSE2 SIMD mode requested, but the SSE2 tier is unavailable")
+    fn expect_sse() -> Sse {
+        Sse::from_features(detect_features())
+            .expect("SSE SIMD mode requested, but the SSE tier is unavailable")
     }
 
-    fn expect_sse2_without_avx2() -> V1 {
-        assert!(V3::try_new().is_none(), "SSE2 dispatch fallback test must run with AVX2 hidden");
-        expect_sse2()
+    fn expect_sse_without_avx() -> Sse {
+        assert!(
+            Avx::from_features(detect_features()).is_none(),
+            "SSE dispatch fallback test must run with AVX hidden"
+        );
+        expect_sse()
     }
 }
 

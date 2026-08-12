@@ -1,12 +1,9 @@
-// AVX2 V3 tier: OpenEXR's "dctInverse8x8_avx_0". Each pass runs all 8
+// AVX tier: OpenEXR's "dctInverse8x8_avx_0". Each pass runs all 8
 // rows/columns of the block in parallel, one 8-wide register per position.
-//
-// `dct_inverse_8x8_batch` runs the kernel through `V3::vectorize` rather
-// than calling it as an ordinary function.
+// Despite the "avx2" filename (kept to match the tier-file convention shared
+// with `color_space_conversion`/`lossy_dct`), every op here is base AVX
 
-use std::arch::x86_64::__m256;
-
-use pulp::{cast, f32x8, x86::V3};
+use miraculix::x86::ops::avx::avx::Avx;
 
 use super::super::forward_basis;
 
@@ -17,38 +14,35 @@ use super::super::forward_basis;
 // faster to build and ~25% faster once fused with the row_pass math that
 // consumes it -> LLVM compiles the scalar-gather construction into a chain of
 // `vinsertps`-per-scalar instructions rather than a handful of wide shuffles.
-#[inline(always)] // must fuse into the `vectorize` closure -> see `Coefficients::new`
-fn transpose8x8(v3: V3, rows: [f32x8; 8]) -> [f32x8; 8] {
-    let avx = v3.avx;
-    let r: [__m256; 8] = rows.map(|row| cast!(row));
+#[inline(always)]
+fn transpose8x8(avx: Avx, rows: [[f32; 8]; 8]) -> [[f32; 8]; 8] {
+    let t0 = avx.unpacklo_f32x8(rows[0], rows[1]);
+    let t1 = avx.unpackhi_f32x8(rows[0], rows[1]);
+    let t2 = avx.unpacklo_f32x8(rows[2], rows[3]);
+    let t3 = avx.unpackhi_f32x8(rows[2], rows[3]);
+    let t4 = avx.unpacklo_f32x8(rows[4], rows[5]);
+    let t5 = avx.unpackhi_f32x8(rows[4], rows[5]);
+    let t6 = avx.unpacklo_f32x8(rows[6], rows[7]);
+    let t7 = avx.unpackhi_f32x8(rows[6], rows[7]);
 
-    let t0 = avx._mm256_unpacklo_ps(r[0], r[1]);
-    let t1 = avx._mm256_unpackhi_ps(r[0], r[1]);
-    let t2 = avx._mm256_unpacklo_ps(r[2], r[3]);
-    let t3 = avx._mm256_unpackhi_ps(r[2], r[3]);
-    let t4 = avx._mm256_unpacklo_ps(r[4], r[5]);
-    let t5 = avx._mm256_unpackhi_ps(r[4], r[5]);
-    let t6 = avx._mm256_unpacklo_ps(r[6], r[7]);
-    let t7 = avx._mm256_unpackhi_ps(r[6], r[7]);
-
-    let tt0 = avx._mm256_shuffle_ps::<0x44>(t0, t2);
-    let tt1 = avx._mm256_shuffle_ps::<0xEE>(t0, t2);
-    let tt2 = avx._mm256_shuffle_ps::<0x44>(t1, t3);
-    let tt3 = avx._mm256_shuffle_ps::<0xEE>(t1, t3);
-    let tt4 = avx._mm256_shuffle_ps::<0x44>(t4, t6);
-    let tt5 = avx._mm256_shuffle_ps::<0xEE>(t4, t6);
-    let tt6 = avx._mm256_shuffle_ps::<0x44>(t5, t7);
-    let tt7 = avx._mm256_shuffle_ps::<0xEE>(t5, t7);
+    let tt0 = avx.shuffle_f32x8::<0x44>(t0, t2);
+    let tt1 = avx.shuffle_f32x8::<0xEE>(t0, t2);
+    let tt2 = avx.shuffle_f32x8::<0x44>(t1, t3);
+    let tt3 = avx.shuffle_f32x8::<0xEE>(t1, t3);
+    let tt4 = avx.shuffle_f32x8::<0x44>(t4, t6);
+    let tt5 = avx.shuffle_f32x8::<0xEE>(t4, t6);
+    let tt6 = avx.shuffle_f32x8::<0x44>(t5, t7);
+    let tt7 = avx.shuffle_f32x8::<0xEE>(t5, t7);
 
     [
-        cast!(avx._mm256_permute2f128_ps::<0x20>(tt0, tt4)),
-        cast!(avx._mm256_permute2f128_ps::<0x20>(tt1, tt5)),
-        cast!(avx._mm256_permute2f128_ps::<0x20>(tt2, tt6)),
-        cast!(avx._mm256_permute2f128_ps::<0x20>(tt3, tt7)),
-        cast!(avx._mm256_permute2f128_ps::<0x31>(tt0, tt4)),
-        cast!(avx._mm256_permute2f128_ps::<0x31>(tt1, tt5)),
-        cast!(avx._mm256_permute2f128_ps::<0x31>(tt2, tt6)),
-        cast!(avx._mm256_permute2f128_ps::<0x31>(tt3, tt7)),
+        avx.permute2f128_f32x8::<0x20>(tt0, tt4),
+        avx.permute2f128_f32x8::<0x20>(tt1, tt5),
+        avx.permute2f128_f32x8::<0x20>(tt2, tt6),
+        avx.permute2f128_f32x8::<0x20>(tt3, tt7),
+        avx.permute2f128_f32x8::<0x31>(tt0, tt4),
+        avx.permute2f128_f32x8::<0x31>(tt1, tt5),
+        avx.permute2f128_f32x8::<0x31>(tt2, tt6),
+        avx.permute2f128_f32x8::<0x31>(tt3, tt7),
     ]
 }
 
@@ -62,57 +56,53 @@ const F: f32 = 1.913422e-1;
 const G: f32 = 9.754573e-2;
 
 // Public to the crate so the fused lossy-DCT decode path can build the
-// constants once per `vectorize` trampoline and reuse them across every
-// block's in-register iDCT (see `inverse_one`).
+// constants once per block loop and reuse them across every block's
+// in-register iDCT (see `inverse_one`).
 pub(crate) struct Coefficients {
-    a: f32x8,
-    na: f32x8,
-    b: f32x8,
-    nb: f32x8,
-    c: f32x8,
-    nc: f32x8,
-    d: f32x8,
+    a: [f32; 8],
+    na: [f32; 8],
+    b: [f32; 8],
+    nb: [f32; 8],
+    c: [f32; 8],
+    nc: [f32; 8],
+    d: [f32; 8],
     // no "nd": the AVX never multiplies by -D
-    e: f32x8,
-    ne: f32x8,
-    f: f32x8,
-    nf: f32x8,
-    g: f32x8,
-    ng: f32x8,
+    e: [f32; 8],
+    ne: [f32; 8],
+    f: [f32; 8],
+    nf: [f32; 8],
+    g: [f32; 8],
+    ng: [f32; 8],
 }
 
 impl Coefficients {
-    // This, `row_pass`, and `column_pass` must inline into the
-    // `vectorize` closure below for their ops to fuse into avx2
-    // instructions; LLVM inlining heuristics aren't reliable
-    // enough to guarantee that on their own
     #[inline(always)]
-    pub(crate) fn new(v3: V3) -> Self {
+    pub(crate) fn new(_avx: Avx) -> Self {
         // Negated splats are exact (sign flip), so "x * na == -(x * a)".
         Self {
-            a: v3.splat_f32x8(A),
-            na: v3.splat_f32x8(-A),
-            b: v3.splat_f32x8(B),
-            nb: v3.splat_f32x8(-B),
-            c: v3.splat_f32x8(C),
-            nc: v3.splat_f32x8(-C),
-            d: v3.splat_f32x8(D),
-            e: v3.splat_f32x8(E),
-            ne: v3.splat_f32x8(-E),
-            f: v3.splat_f32x8(F),
-            nf: v3.splat_f32x8(-F),
-            g: v3.splat_f32x8(G),
-            ng: v3.splat_f32x8(-G),
+            a: [A; 8],
+            na: [-A; 8],
+            b: [B; 8],
+            nb: [-B; 8],
+            c: [C; 8],
+            nc: [-C; 8],
+            d: [D; 8],
+            e: [E; 8],
+            ne: [-E; 8],
+            f: [F; 8],
+            nf: [-F; 8],
+            g: [G; 8],
+            ng: [-G; 8],
         }
     }
 }
 
 // OpenEXRs "IDCT_AVX_MMULT_ROWS" + "EO_TO_ROW_HALVES"
-#[inline(always)] // must fuse into the `vectorize` closure --> see `Coefficients::new`
-fn row_pass(v3: V3, coef: &Coefficients, input: [f32x8; 8]) -> [f32x8; 8] {
-    let mul = |a, b| v3.mul_f32x8(a, b);
-    let add = |a, b| v3.add_f32x8(a, b);
-    let sub = |a, b| v3.sub_f32x8(a, b);
+#[inline(always)]
+fn row_pass(avx: Avx, coef: &Coefficients, input: [[f32; 8]; 8]) -> [[f32; 8]; 8] {
+    let mul = |a, b| avx.mul_f32x8(a, b);
+    let add = |a, b| avx.add_f32x8(a, b);
+    let sub = |a, b| avx.sub_f32x8(a, b);
 
     let (in0, in2, in4, in6) = (input[0], input[2], input[4], input[6]);
     let (in1, in3, in5, in7) = (input[1], input[3], input[5], input[7]);
@@ -148,11 +138,11 @@ fn row_pass(v3: V3, coef: &Coefficients, input: [f32x8; 8]) -> [f32x8; 8] {
 }
 
 // The column transform from the back half of "dctInverse8x8_avx_0".
-#[inline(always)] // must fuse into the `vectorize` closure --> see `Coefficients::new`
-fn column_pass(v3: V3, coef: &Coefficients, input: [f32x8; 8]) -> [f32x8; 8] {
-    let mul = |a, b| v3.mul_f32x8(a, b);
-    let add = |a, b| v3.add_f32x8(a, b);
-    let sub = |a, b| v3.sub_f32x8(a, b);
+#[inline(always)]
+fn column_pass(avx: Avx, coef: &Coefficients, input: [[f32; 8]; 8]) -> [[f32; 8]; 8] {
+    let mul = |a, b| avx.mul_f32x8(a, b);
+    let add = |a, b| avx.add_f32x8(a, b);
+    let sub = |a, b| avx.sub_f32x8(a, b);
 
     let (in0, in1, in2, in3, in4, in5, in6, in7) =
         (input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7]);
@@ -190,19 +180,11 @@ fn column_pass(v3: V3, coef: &Coefficients, input: [f32x8; 8]) -> [f32x8; 8] {
 }
 
 #[cfg(any(feature = "avx2-tests", feature = "simd-benches"))]
-pub fn dct_inverse_8x8(v3: V3, data: &mut [f32; 64]) {
-    dct_inverse_8x8_batch(v3, std::iter::once(data));
+pub fn dct_inverse_8x8(avx: Avx, data: &mut [f32; 64]) {
+    dct_inverse_8x8_batch(avx, std::iter::once(data));
 }
 
-// `V3::vectorize` runs a `FnOnce()` closure inside pulps own
-// `#[target_feature(enable = "avx2,fma")]` trampoline; passing the
-// kernel as a closure, rather than calling it as an ordinary function,
-// is what lets that closures body inline and fuse into avx2
-// instructions.
-//
-// One 8x8 inverse DCT. Must be called from inside a `V3::vectorize`
-// trampoline (or another `#[target_feature(enable = "avx2,fma")]` body)
-// so the ops lower to AVX2; the fused decode path relies on that.
+// One 8x8 inverse DCT.
 //
 // Full iDCT stays in registers: load 8 rows -> transpose to the column-major
 // shape row_pass wants -> row_pass -> transpose back to rows for column_pass
@@ -210,10 +192,10 @@ pub fn dct_inverse_8x8(v3: V3, data: &mut [f32; 64]) {
 // it was pure intermediate L1 traffic for a 256-byte block that already
 // fits in registers.
 #[inline(always)]
-pub(crate) fn inverse_one(v3: V3, coef: &Coefficients, data: &mut [f32; 64]) {
-    let rows: [f32x8; 8] = std::array::from_fn(|row| {
+pub(crate) fn inverse_one(avx: Avx, coef: &Coefficients, data: &mut [f32; 64]) {
+    let rows: [[f32; 8]; 8] = std::array::from_fn(|row| {
         let b = row * 8;
-        f32x8(
+        [
             data[b],
             data[b + 1],
             data[b + 2],
@@ -222,77 +204,81 @@ pub(crate) fn inverse_one(v3: V3, coef: &Coefficients, data: &mut [f32; 64]) {
             data[b + 5],
             data[b + 6],
             data[b + 7],
-        )
+        ]
     });
-    let columns = transpose8x8(v3, rows);
-    let row_pass_out = row_pass(v3, &coef, columns);
+    let columns = transpose8x8(avx, rows);
+    let row_pass_out = row_pass(avx, coef, columns);
     // row_pass_out[col].lane[row] = intermediate[row][col]; the 8x8
     // transpose is an involution, so one more pass yields
     // intermediate_rows[row].lane[col] for column_pass.
-    let intermediate_rows = transpose8x8(v3, row_pass_out);
-    let columns_out = column_pass(v3, &coef, intermediate_rows);
+    let intermediate_rows = transpose8x8(avx, row_pass_out);
+    let columns_out = column_pass(avx, coef, intermediate_rows);
     for (row, result) in columns_out.iter().enumerate() {
         let b = row * 8;
-        data[b] = result.0;
-        data[b + 1] = result.1;
-        data[b + 2] = result.2;
-        data[b + 3] = result.3;
-        data[b + 4] = result.4;
-        data[b + 5] = result.5;
-        data[b + 6] = result.6;
-        data[b + 7] = result.7;
+        data[b..b + 8].copy_from_slice(result);
     }
 }
 
-// `vectorize` fixed overhead per call
-pub fn dct_inverse_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
-    v3.vectorize(move || {
-        let coef = Coefficients::new(v3);
+// Wrapped in `miraculix::avx_fn!` (not a plain function): `inverse_one`
+// alone composes 2 `transpose8x8`s (8 unpack + 8 shuffle + 8 permute2f128
+// each) plus `row_pass`/`column_pass`'s ~40 mul/add/sub -- needs a shared
+// `#[target_feature]` context or LLVM refuses to inline any of it into the
+// caller, leaving real function calls (with a loadu/storeu round trip per
+// call) where vector instructions belong. Confirmed via `llvm-objdump`
+// during the port: without this, the loop compiled to hundreds of `callq`s
+// into individual `miraculix::x86::ops::avx::avx::mulps`/`addps` and zero
+// `ymm` instructions; wrapped, it inlines into the real transpose/butterfly.
+// A closure-based `.vectorize()` trampoline was tried first and dropped --
+// see `miraculix::x86::fn_macros`' module doc for why it isn't reliable.
+miraculix::avx_fn! {
+    pub fn dct_inverse_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
+        let coef = Coefficients::new(avx);
         for data in blocks {
-            inverse_one(v3, &coef, data);
+            inverse_one(avx, &coef, data);
         }
-    });
+    }
 }
 
 struct ForwardCoefficients {
-    terms: [f32x8; 8],
+    terms: [[f32; 8]; 8],
 }
 
 impl ForwardCoefficients {
     #[inline(always)]
-    fn new(_v3: V3) -> Self {
+    fn new(_avx: Avx) -> Self {
         let basis = forward_basis();
         Self {
             terms: std::array::from_fn(|input| {
                 let row = basis[input];
-                f32x8(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7])
+                [row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]]
             }),
         }
     }
 }
 
 #[inline(always)]
-fn forward_pass(v3: V3, coef: &ForwardCoefficients, input: [f32; 8]) -> f32x8 {
-    let mul = |a, b| v3.mul_f32x8(a, b);
-    let add = |a, b| v3.add_f32x8(a, b);
-    let splat = |value: f32| v3.splat_f32x8(value);
+fn forward_pass(avx: Avx, coef: &ForwardCoefficients, input: [f32; 8]) -> [f32; 8] {
+    let mul = |a, b| avx.mul_f32x8(a, b);
+    let add = |a, b| avx.add_f32x8(a, b);
 
-    let mut out = v3.splat_f32x8(0.0);
+    let mut out = [0.0f32; 8];
     for index in 0..8 {
-        out = add(out, mul(splat(input[index]), coef.terms[index]));
+        out = add(out, mul([input[index]; 8], coef.terms[index]));
     }
     out
 }
 
 // TODO just #[test]
 #[cfg(any(feature = "avx2-tests", feature = "simd-benches"))]
-pub fn dct_forward_8x8(v3: V3, data: &mut [f32; 64]) {
-    dct_forward_8x8_batch(v3, std::iter::once(data));
+pub fn dct_forward_8x8(avx: Avx, data: &mut [f32; 64]) {
+    dct_forward_8x8_batch(avx, std::iter::once(data));
 }
 
-pub fn dct_forward_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
-    v3.vectorize(move || {
-        let coef = ForwardCoefficients::new(v3);
+// Wrapped in `avx.vectorize`
+// Wrapped in `miraculix::avx_fn!`
+miraculix::avx_fn! {
+    pub fn dct_forward_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [f32; 64]>) {
+        let coef = ForwardCoefficients::new(avx);
         let basis = forward_basis();
 
         for data in blocks {
@@ -310,15 +296,8 @@ pub fn dct_forward_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f
                     data[base + 6],
                     data[base + 7],
                 ];
-                let out = forward_pass(v3, &coef, input);
-                data[base] = out.0;
-                data[base + 1] = out.1;
-                data[base + 2] = out.2;
-                data[base + 3] = out.3;
-                data[base + 4] = out.4;
-                data[base + 5] = out.5;
-                data[base + 6] = out.6;
-                data[base + 7] = out.7;
+                let out = forward_pass(avx, &coef, input);
+                data[base..base + 8].copy_from_slice(&out);
             }
 
             // Column pass: batched across all 8 columns via SIMD lanes
@@ -326,10 +305,10 @@ pub fn dct_forward_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f
             // read. Each row is loaded contiguously once and fanned into 8
             // per-frequency accumulators (one lane per column), which are
             // then stored back contiguously per output row.
-            let mut outputs = [v3.splat_f32x8(0.0); 8];
+            let mut outputs = [[0.0f32; 8]; 8];
             for row in 0..8 {
                 let base = row * 8;
-                let row_vec = f32x8(
+                let row_vec = [
                     data[base],
                     data[base + 1],
                     data[base + 2],
@@ -338,24 +317,17 @@ pub fn dct_forward_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [f
                     data[base + 5],
                     data[base + 6],
                     data[base + 7],
-                );
+                ];
                 for v in 0..8 {
-                    let coefficient = v3.splat_f32x8(basis[row][v]);
-                    outputs[v] = v3.add_f32x8(outputs[v], v3.mul_f32x8(coefficient, row_vec));
+                    let coefficient = [basis[row][v]; 8];
+                    outputs[v] = avx.add_f32x8(outputs[v], avx.mul_f32x8(coefficient, row_vec));
                 }
             }
 
             for (v, out) in outputs.iter().enumerate() {
                 let base = v * 8;
-                data[base] = out.0;
-                data[base + 1] = out.1;
-                data[base + 2] = out.2;
-                data[base + 3] = out.3;
-                data[base + 4] = out.4;
-                data[base + 5] = out.5;
-                data[base + 6] = out.6;
-                data[base + 7] = out.7;
+                data[base..base + 8].copy_from_slice(out);
             }
         }
-    });
+    }
 }

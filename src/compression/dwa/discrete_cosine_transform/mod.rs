@@ -4,10 +4,10 @@
 // tier at runtime (avx2 > sse2 > scalar), like OpenEXRs cpuid-based
 // `initializeFuncs`
 //
-// Dispatch uses pulp's V3/V1 tokens, constructed only after a runtime CPU
-// feature check. V3 needs AVX2+FMA, so
-// AVX-only CPUs (Sandy/Ivy Bridge) fall back to sse2 here, where OpenEXR
-// would use its own (non-avx2) avx kernel.
+// Dispatch uses miraculix's `Avx`/`Avx2`/`Sse` tokens, constructed only after
+// a runtime CPU feature check. The AVX2 tier needs AVX2+FMA, so AVX-only CPUs
+// (Sandy/Ivy Bridge) fall back to sse2 here, where OpenEXR would use its own
+// (non-avx2) avx kernel.
 //
 // The three kernels aren't bit-identical to each other (OpenEXRs own
 // kernels disagree too: basis-constant precision and summation order

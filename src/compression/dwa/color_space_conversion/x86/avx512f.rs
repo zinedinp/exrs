@@ -36,9 +36,15 @@ fn store_pair(a: &mut [f32; 64], b: &mut [f32; 64], base: usize, value: [f32; 16
     b[base..base + 8].copy_from_slice(&value[8..16]);
 }
 
-#[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
-pub fn csc709_forward_8x8_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f32; 64]; 3]) {
-    forward_pair(avx512f, a, b);
+// Wrapped in `miraculix::avx512f_fn!`: the composed `add_f32x16`/
+// `mul_f32x16`/`sub_f32x16` chain per chunk needs a shared
+// `#[target_feature]` context to inline into real `zmm` code instead of a
+// `callq` chain
+miraculix::avx512f_fn! {
+    #[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
+    pub fn csc709_forward_8x8_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f32; 64]; 3]) {
+        forward_pair(avx512f, a, b);
+    }
 }
 
 #[inline(always)]
@@ -70,9 +76,11 @@ pub(crate) fn forward_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f
     }
 }
 
-#[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
-pub fn csc709_inverse_8x8_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f32; 64]; 3]) {
-    inverse_pair(avx512f, a, b);
+miraculix::avx512f_fn! {
+    #[cfg(any(feature = "avx512-tests", feature = "simd-benches"))]
+    pub fn csc709_inverse_8x8_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f32; 64]; 3]) {
+        inverse_pair(avx512f, a, b);
+    }
 }
 
 /// One 8x8 inverse CSC for each of two blocks at once.
@@ -104,35 +112,40 @@ pub(crate) fn inverse_pair(avx512f: Avx512f, a: &mut [[f32; 64]; 3], b: &mut [[f
     }
 }
 
-pub fn csc709_inverse_8x8_batch<'a>(
-    avx512f: Avx512f,
-    blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>,
-) {
-    let mut iter = blocks;
-    loop {
-        let Some(first) = iter.next() else { break };
-        match iter.next() {
-            Some(second) => inverse_pair(avx512f, first, second),
-            None => {
-                super::super::csc709_inverse_8x8_autovectorized(first);
-                break;
+// Wrapped in `miraculix::avx512f_fn!`
+miraculix::avx512f_fn! {
+    pub fn csc709_inverse_8x8_batch<'a>(
+        avx512f: Avx512f,
+        blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>,
+    ) {
+        let mut iter = blocks;
+        loop {
+            let Some(first) = iter.next() else { break };
+            match iter.next() {
+                Some(second) => inverse_pair(avx512f, first, second),
+                None => {
+                    super::super::csc709_inverse_8x8_autovectorized(first);
+                    break;
+                }
             }
         }
     }
 }
 
-pub fn csc709_forward_8x8_batch<'a>(
-    avx512f: Avx512f,
-    blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>,
-) {
-    let mut iter = blocks;
-    loop {
-        let Some(first) = iter.next() else { break };
-        match iter.next() {
-            Some(second) => forward_pair(avx512f, first, second),
-            None => {
-                super::super::csc709_forward_8x8_autovectorized(first);
-                break;
+miraculix::avx512f_fn! {
+    pub fn csc709_forward_8x8_batch<'a>(
+        avx512f: Avx512f,
+        blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>,
+    ) {
+        let mut iter = blocks;
+        loop {
+            let Some(first) = iter.next() else { break };
+            match iter.next() {
+                Some(second) => forward_pair(avx512f, first, second),
+                None => {
+                    super::super::csc709_forward_8x8_autovectorized(first);
+                    break;
+                }
             }
         }
     }

@@ -12,14 +12,17 @@
 // also falls back to the AVX2 tier's single-block fused body.
 
 use miraculix::x86::ops::avx::avx::Avx;
+use miraculix::x86::ops::avx::f16c::F16c;
+use miraculix::x86::ops::avx512::avx512dq::Avx512Dq;
 use miraculix::x86::ops::avx512::avx512f::Avx512f;
-use pulp::core_arch::x86::F16c;
-use pulp::x86::{V3, V4};
+use miraculix::x86::ops::sse::sse2::Sse2;
+use miraculix::x86::ops::sse::sse41::Sse41;
+use miraculix::x86::ops::sse::ssse3::Ssse3;
 
 use crate::{
     compression::dwa::{
         color_space_conversion,
-        discrete_cosine_transform::x86::{avx2 as dct_avx2, avx512 as dct_avx512},
+        discrete_cosine_transform::x86::{avx as dct_avx2, avx512dq as dct_avx512},
     },
     error::{Error, Result as ExrResult},
     meta::attribute::SampleType,
@@ -39,7 +42,7 @@ use super::ROUND_TO_NEAREST;
 /// check in `step_pair_or_single`.
 #[inline(always)]
 fn write_pair_block(
-    v4: V4,
+    avx512f: Avx512f,
     block_x0: usize,
     block_y: usize,
     y_count: usize,
@@ -61,8 +64,8 @@ fn write_pair_block(
             let out_row = &mut out[offset..][..16 * bytes_per_sample];
 
             let handled = match target.sample_type {
-                SampleType::F16 => write_row16_f16(v4, row_a, row_b, to_linear, out_row),
-                SampleType::F32 => write_row16_f32(v4, row_a, row_b, to_linear, out_row),
+                SampleType::F16 => write_row16_f16(avx512f, row_a, row_b, to_linear, out_row),
+                SampleType::F32 => write_row16_f32(avx512f, row_a, row_b, to_linear, out_row),
                 SampleType::U32 => false,
             };
             if handled {
@@ -80,33 +83,30 @@ fn write_pair_block(
     None
 }
 
-// `v4_fn!` instead of `V4::vectorize`: this body calls `dct_avx512::inverse_pair`
-// / `inverse_quad`, which bottom out in `recombine` -- the function whose
-// codegen silently degraded ~50x under the closure trampoline (LLVM's optional
-// inlining pass declined to merge it). `v4_fn!` pastes the body directly inside
-// a `#[target_feature]` function instead, guaranteeing real AVX-512 codegen.
-//
-// Dual-port logic stays *inside* this body (no external helpers): callees of a
-// `#[target_feature]` fn do not inherit the feature set unless fully inlined.
-//
 // RGB component dual-port is **opt-in** (`dwa-avx512-rgb-comp-quad`): when R and
 // G both need pair-iDCT, `inverse_quad(R∥G)` then needs-match B. Microbench is
 // a real win; whole-pipeline A/B regressed `lossy_dct` slightly — default stays
 // the sequential 3× `inverse_pair` loop. Profile counters (under `dwa-profile`)
 // record pair-step / quad-hit rate when the feature is on.
-pulp::v4_fn! {
+// Wrapped in `miraculix::avx512_fn!` (not a plain function): this body
+// composes DCT's 8x8x2 register-transpose (unpack + shuffle + `Avx::
+// permute2f128`/`Avx512Dq::extract`/`insert` recombine) with CSC's
+// elementwise pass, dozens of chained token-method calls that need a shared
+// `#[target_feature]` context to inline into real `zmm` code.
+miraculix::avx512_fn! {
+    #[allow(clippy::too_many_arguments)]
     fn decode_pair_dct_csc(
-        v4: V4,
-        v3: V3,
         avx512f: Avx512f,
+        avx: Avx,
+        avx512dq: Avx512Dq,
         components: usize,
         needs_a: [bool; 3],
         needs_b: [bool; 3],
         dct_a: &mut [[f32; 64]; 3],
         dct_b: &mut [[f32; 64]; 3],
     ) {
-        let coef2 = dct_avx2::Coefficients::new(v3);
-        let coef4 = dct_avx512::Coefficients::new(v4);
+        let coef2 = dct_avx2::Coefficients::new(avx);
+        let coef4 = dct_avx512::Coefficients::new(avx512f);
 
         #[cfg(feature = "dwa-profile")]
         if components == 3 {
@@ -133,7 +133,9 @@ pulp::v4_fn! {
             let (b_r, b_rest) = dct_b.split_at_mut(1);
             let (b_g, b_b) = b_rest.split_at_mut(1);
             dct_avx512::inverse_quad(
-                v4,
+                avx512f,
+                avx,
+                avx512dq,
                 &coef4,
                 &mut a_r[0],
                 &mut b_r[0],
@@ -142,13 +144,15 @@ pulp::v4_fn! {
             );
             match (needs_a[2], needs_b[2]) {
                 (true, true) => {
-                    dct_avx512::inverse_pair(v4, &coef4, &mut a_b[0], &mut b_b[0]);
+                    dct_avx512::inverse_pair(
+                        avx512f, avx, avx512dq, &coef4, &mut a_b[0], &mut b_b[0],
+                    );
                 }
                 (true, false) => {
-                    dct_avx2::inverse_one(v3, &coef2, &mut a_b[0]);
+                    dct_avx2::inverse_one(avx, &coef2, &mut a_b[0]);
                 }
                 (false, true) => {
-                    dct_avx2::inverse_one(v3, &coef2, &mut b_b[0]);
+                    dct_avx2::inverse_one(avx, &coef2, &mut b_b[0]);
                 }
                 (false, false) => {}
             }
@@ -157,17 +161,19 @@ pulp::v4_fn! {
                 match (needs_a[component], needs_b[component]) {
                     (true, true) => {
                         dct_avx512::inverse_pair(
-                            v4,
+                            avx512f,
+                            avx,
+                            avx512dq,
                             &coef4,
                             &mut dct_a[component],
                             &mut dct_b[component],
                         );
                     }
                     (true, false) => {
-                        dct_avx2::inverse_one(v3, &coef2, &mut dct_a[component]);
+                        dct_avx2::inverse_one(avx, &coef2, &mut dct_a[component]);
                     }
                     (false, true) => {
-                        dct_avx2::inverse_one(v3, &coef2, &mut dct_b[component]);
+                        dct_avx2::inverse_one(avx, &coef2, &mut dct_b[component]);
                     }
                     (false, false) => {}
                 }
@@ -175,7 +181,7 @@ pulp::v4_fn! {
         }
 
         if components == 3 {
-            color_space_conversion::x86::avx512::inverse_pair(avx512f, dct_a, dct_b);
+            color_space_conversion::x86::avx512f::inverse_pair(avx512f, dct_a, dct_b);
         }
     }
 }
@@ -188,11 +194,13 @@ pulp::v4_fn! {
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn step_pair_or_single(
-    v4: V4,
-    v3: V3,
+    sse2: Sse2,
+    ssse3: Ssse3,
+    sse41: Sse41,
     f16c: F16c,
     avx: Avx,
     avx512f: Avx512f,
+    avx512dq: Avx512Dq,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     block_index: usize,
@@ -215,9 +223,9 @@ fn step_pair_or_single(
     let x_count0 = 8.min(width - block_x0 * 8);
     let y_count0 = 8.min(height - block_y0 * 8);
 
-    if let Err(e) =
-        zigzag_block(v3, f16c, ac, dc, components, block_count, block_index, &mut dct_a, &mut needs_a)
-    {
+    if let Err(e) = zigzag_block(
+        sse2, ssse3, sse41, f16c, ac, dc, components, block_count, block_index, &mut dct_a, &mut needs_a,
+    ) {
         return (block_index, Some(e));
     }
 
@@ -229,20 +237,14 @@ fn step_pair_or_single(
         let y_count1 = 8.min(height - block_y1 * 8);
 
         if let Err(e) = zigzag_block(
-            v3,
-            f16c,
-            ac,
-            dc,
-            components,
-            block_count,
-            next_index,
-            &mut dct_b,
-            &mut needs_b,
+            sse2, ssse3, sse41, f16c, ac, dc, components, block_count, next_index, &mut dct_b, &mut needs_b,
         ) {
             return (next_index, Some(e));
         }
 
-        decode_pair_dct_csc(v4, v3, avx512f, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
+        decode_pair_dct_csc(
+            avx512f, avx, avx512dq, components, needs_a, needs_b, &mut dct_a, &mut dct_b,
+        );
 
         // Pair-write is only valid when B sits immediately right of A in the
         // same block row (so their output spans are contiguous) and B is
@@ -250,14 +252,14 @@ fn step_pair_or_single(
         // last column in a row can be a partial block).
         let pair_contiguous = block_y0 == block_y1 && block_x1 == block_x0 + 1 && x_count1 == 8;
         let write_err = if pair_contiguous {
-            write_pair_block(v4, block_x0, block_y0, y_count0, to_linear, &dct_a, &dct_b, targets, out)
+            write_pair_block(avx512f, block_x0, block_y0, y_count0, to_linear, &dct_a, &dct_b, targets, out)
         } else {
             let mut write_err = write_block(
-                v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out,
+                f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out,
             );
             if write_err.is_none() {
                 write_err = write_block(
-                    v3, f16c, block_x1, block_y1, x_count1, y_count1, to_linear, &dct_b, targets, out,
+                    f16c, block_x1, block_y1, x_count1, y_count1, to_linear, &dct_b, targets, out,
                 );
             }
             write_err
@@ -266,25 +268,47 @@ fn step_pair_or_single(
         (block_index + 2, write_err)
     } else {
         // Odd trailing block: not worth a 2-block kernel for one block.
-        let mut write_err: Option<Error> = None;
-        v3.vectorize(|| {
-            let coef = dct_avx2::Coefficients::new(v3);
-            for component in 0..components {
-                if needs_a[component] {
-                    dct_avx2::inverse_one(v3, &coef, &mut dct_a[component]);
-                }
-            }
-
-            if components == 3 {
-                color_space_conversion::x86::avx2::inverse_one(avx, &mut dct_a);
-            }
-
-            write_err = write_block(
-                v3, f16c, block_x0, block_y0, x_count0, y_count0, to_linear, &dct_a, targets, out,
-            );
-        });
+        let write_err = decode_single_dct_csc(
+            f16c, avx, components, needs_a, &mut dct_a, block_x0, block_y0, x_count0, y_count0, to_linear,
+            targets, out,
+        );
 
         (block_index + 1, write_err)
+    }
+}
+
+// The odd-trailing-block path's iDCT + optional CSC + write, extracted so
+// `miraculix::avx_fn!` can wrap the whole thing: composes `dct_avx2::
+// inverse_one`'s register transpose with CSC's elementwise pass, needing a
+// shared `#[target_feature]` context.
+miraculix::avx_fn! {
+    #[allow(clippy::too_many_arguments)]
+    fn decode_single_dct_csc(
+        f16c: F16c,
+        avx: Avx,
+        components: usize,
+        needs_a: [bool; 3],
+        dct_a: &mut [[f32; 64]; 3],
+        block_x0: usize,
+        block_y0: usize,
+        x_count0: usize,
+        y_count0: usize,
+        to_linear: Option<&[u16; 65536]>,
+        targets: &mut [ScanlineTarget<'_>],
+        out: &mut [u8],
+    ) -> Option<Error> {
+        let coef = dct_avx2::Coefficients::new(avx);
+        for component in 0..components {
+            if needs_a[component] {
+                dct_avx2::inverse_one(avx, &coef, &mut dct_a[component]);
+            }
+        }
+
+        if components == 3 {
+            color_space_conversion::x86::avx::inverse_one(avx, dct_a);
+        }
+
+        write_block(f16c, block_x0, block_y0, x_count0, y_count0, to_linear, dct_a, targets, out)
     }
 }
 
@@ -299,11 +323,15 @@ fn step_pair_or_single(
 /// DCT/CSC step processes 2 spatial blocks at once (one 512-bit register per
 /// step). Zigzag and write stay on the single-block AVX2+F16C kernels, except
 /// write widens to 16 lanes for horizontally-adjacent pairs (`write_pair_block`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decode_group_fused(
-    v4: V4,
+    sse2: Sse2,
+    ssse3: Ssse3,
+    sse41: Sse41,
     f16c: F16c,
     avx: Avx,
     avx512f: Avx512f,
+    avx512dq: Avx512Dq,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     width: usize,
@@ -312,8 +340,6 @@ pub(super) fn decode_group_fused(
     targets: &mut [ScanlineTarget<'_>],
     out: &mut [u8],
 ) -> ExrResult<()> {
-    let v3: V3 = *v4;
-
     let components = targets.len();
     if components != 1 && components != 3 {
         return Err(Error::invalid("invalid DWA lossy component count"));
@@ -326,8 +352,8 @@ pub(super) fn decode_group_fused(
     let mut block_index = 0usize;
     while block_index < block_count {
         let (next, err) = step_pair_or_single(
-            v4, v3, f16c, avx, avx512f, ac, dc, block_index, block_count, blocks_x, width, height,
-            components, to_linear, targets, out,
+            sse2, ssse3, sse41, f16c, avx, avx512f, avx512dq, ac, dc, block_index, block_count, blocks_x,
+            width, height, components, to_linear, targets, out,
         );
         if let Some(e) = err {
             return Err(e);
@@ -339,104 +365,82 @@ pub(super) fn decode_group_fused(
     Ok(())
 }
 
-/// 16-lane analog of `avx2::write_row_f16`: block A's row in lanes 0-7,
-/// block B's row in lanes 8-15. `_mm512_cvtps_ph` is AVX-512F's own
-/// half-conversion (unlike the AVX2 path, no separate F16C capability check
-/// needed). The `to_linear` gather still runs as two 8-lane extract/lookup/
-/// insert passes -- reusing `linearize_lanes` unchanged rather than a wider
-/// gather instruction, since pulp only exposes the AVX-512 gather
-/// intrinsics as `unsafe fn` (raw pointer + index vector), which is off
-/// limits under this crate's `#![forbid(unsafe_code)]`. The win here is
-/// halving the conversion/store instruction count and the write-row call
-/// overhead per pair, not the gather itself.
-#[inline(always)]
-fn write_row16_f16(
-    v4: V4,
-    row_a: &[f32],
-    row_b: &[f32],
-    to_linear: Option<&[u16; 65536]>,
-    out_row: &mut [u8],
-) -> bool {
-    let Ok(&a) = std::convert::TryInto::<&[f32; 8]>::try_into(row_a) else {
-        return false;
-    };
-    let Ok(&b) = std::convert::TryInto::<&[f32; 8]>::try_into(row_b) else {
-        return false;
-    };
-    if out_row.len() != 32 {
-        return false;
-    }
-
-    let va: std::arch::x86_64::__m256 = pulp::cast!(a);
-    let vb: std::arch::x86_64::__m256 = pulp::cast!(b);
-    let combined = v4
-        .avx512dq
-        ._mm512_insertf32x8::<1>(v4.avx512f._mm512_castps256_ps512(va), vb);
-    let nonlinear = v4.avx512f._mm512_cvtps_ph::<ROUND_TO_NEAREST>(combined);
-
-    let linear = match to_linear {
-        Some(table) => {
-            let v3: V3 = *v4;
-            let lo = v4.avx._mm256_castsi256_si128(nonlinear);
-            let hi = v4.avx2._mm256_extracti128_si256::<1>(nonlinear);
-            let lo_lin = linearize_lanes(v3.sse2, lo, table);
-            let hi_lin = linearize_lanes(v3.sse2, hi, table);
-            v4.avx2
-                ._mm256_inserti128_si256::<1>(v4.avx._mm256_castsi128_si256(lo_lin), hi_lin)
+// 16-lane analog of `avx2::write_row_f16`: block A's row in lanes 0-7,
+// block B's row in lanes 8-15. `f32_to_f16x16`/`f16_to_f32x16` are AVX-512F's
+// own native half conversion (unlike the AVX2 path, no separate F16C
+// capability check needed). The `to_linear` gather is `linearize_lanes`
+// unchanged at 16 lanes -- a miraculix register is a plain array, so unlike
+// the pre-port pulp code (which needed a real gather instruction or a
+// GPR extract/lookup/insert roundtrip it didn't have below AVX-512), this is
+// just per-lane indexing at whatever width the caller passes.
+miraculix::avx512f_fn! {
+    fn write_row16_f16(
+        avx512f: Avx512f,
+        row_a: &[f32],
+        row_b: &[f32],
+        to_linear: Option<&[u16; 65536]>,
+        out_row: &mut [u8],
+    ) -> bool {
+        let Ok(&a) = std::convert::TryInto::<&[f32; 8]>::try_into(row_a) else {
+            return false;
+        };
+        let Ok(&b) = std::convert::TryInto::<&[f32; 8]>::try_into(row_b) else {
+            return false;
+        };
+        if out_row.len() != 32 {
+            return false;
         }
-        None => nonlinear,
-    };
 
-    let bytes: [u8; 32] = pulp::cast!(linear);
-    out_row.copy_from_slice(&bytes);
-    true
+        let combined: [f32; 16] = std::array::from_fn(|i| if i < 8 { a[i] } else { b[i - 8] });
+        let nonlinear = avx512f.f32_to_f16x16::<ROUND_TO_NEAREST>(combined);
+
+        let linear = match to_linear {
+            Some(table) => linearize_lanes(nonlinear, table),
+            None => nonlinear,
+        };
+
+        for (chunk, &half) in out_row.chunks_exact_mut(2).zip(linear.iter()) {
+            chunk.copy_from_slice(&half.to_le_bytes());
+        }
+        true
+    }
 }
 
-/// Same as `write_row16_f16`, but widens the linearized halves back to f32
-/// via `_mm512_cvtph_ps` (again native AVX-512F, one 16-lane instruction
-/// covering both blocks), for F32-sample-type channels.
-#[inline(always)]
-fn write_row16_f32(
-    v4: V4,
-    row_a: &[f32],
-    row_b: &[f32],
-    to_linear: Option<&[u16; 65536]>,
-    out_row: &mut [u8],
-) -> bool {
-    let Ok(&a) = std::convert::TryInto::<&[f32; 8]>::try_into(row_a) else {
-        return false;
-    };
-    let Ok(&b) = std::convert::TryInto::<&[f32; 8]>::try_into(row_b) else {
-        return false;
-    };
-    if out_row.len() != 64 {
-        return false;
-    }
-
-    let va: std::arch::x86_64::__m256 = pulp::cast!(a);
-    let vb: std::arch::x86_64::__m256 = pulp::cast!(b);
-    let combined = v4
-        .avx512dq
-        ._mm512_insertf32x8::<1>(v4.avx512f._mm512_castps256_ps512(va), vb);
-    let nonlinear = v4.avx512f._mm512_cvtps_ph::<ROUND_TO_NEAREST>(combined);
-
-    let linear = match to_linear {
-        Some(table) => {
-            let v3: V3 = *v4;
-            let lo = v4.avx._mm256_castsi256_si128(nonlinear);
-            let hi = v4.avx2._mm256_extracti128_si256::<1>(nonlinear);
-            let lo_lin = linearize_lanes(v3.sse2, lo, table);
-            let hi_lin = linearize_lanes(v3.sse2, hi, table);
-            v4.avx2
-                ._mm256_inserti128_si256::<1>(v4.avx._mm256_castsi128_si256(lo_lin), hi_lin)
+// Same as `write_row16_f16`, but widens the linearized halves back to f32
+// via `f16_to_f32x16` (again native AVX-512F, one 16-lane instruction
+// covering both blocks), for F32-sample-type channels.
+miraculix::avx512f_fn! {
+    fn write_row16_f32(
+        avx512f: Avx512f,
+        row_a: &[f32],
+        row_b: &[f32],
+        to_linear: Option<&[u16; 65536]>,
+        out_row: &mut [u8],
+    ) -> bool {
+        let Ok(&a) = std::convert::TryInto::<&[f32; 8]>::try_into(row_a) else {
+            return false;
+        };
+        let Ok(&b) = std::convert::TryInto::<&[f32; 8]>::try_into(row_b) else {
+            return false;
+        };
+        if out_row.len() != 64 {
+            return false;
         }
-        None => nonlinear,
-    };
 
-    let widened = v4.avx512f._mm512_cvtph_ps(linear);
-    let bytes: [u8; 64] = pulp::cast!(widened);
-    out_row.copy_from_slice(&bytes);
-    true
+        let combined: [f32; 16] = std::array::from_fn(|i| if i < 8 { a[i] } else { b[i - 8] });
+        let nonlinear = avx512f.f32_to_f16x16::<ROUND_TO_NEAREST>(combined);
+
+        let linear = match to_linear {
+            Some(table) => linearize_lanes(nonlinear, table),
+            None => nonlinear,
+        };
+
+        let widened = avx512f.f16_to_f32x16(linear);
+        for (chunk, &value) in out_row.chunks_exact_mut(4).zip(widened.iter()) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        true
+    }
 }
 
 // AVX-512 write-pair correctness tests. Opt-in via `avx512-tests`, same
@@ -445,8 +449,9 @@ fn write_row16_f32(
 #[cfg(all(test, feature = "avx512-tests"))]
 mod test {
     use half::f16;
-    use pulp::core_arch::x86::F16c;
-    use pulp::x86::{V3, V4};
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::f16c::F16c;
+    use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
     use super::super::super::transfer_curve::to_linear_table;
     use super::{write_block, write_pair_block, write_row16_f16, write_row16_f32};
@@ -454,8 +459,9 @@ mod test {
 
     use super::super::super::ScanlineTarget;
 
-    fn expect_avx512() -> V4 {
-        V4::try_new().expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
+    fn expect_avx512() -> Avx512f {
+        Avx512f::from_features(detect_features())
+            .expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
     }
 
     fn scalar_linear_bits(value: f32, to_linear: Option<&[u16; 65536]>) -> u16 {
@@ -522,11 +528,11 @@ mod test {
 
     #[test]
     fn write_row16_f16_matches_scalar() {
-        let v4 = expect_avx512();
+        let avx512f = expect_avx512();
         for to_linear in [None, Some(to_linear_table())] {
             for (row_a, row_b) in sweep_row_pairs() {
                 let mut simd = [0u8; 32];
-                assert!(write_row16_f16(v4, &row_a, &row_b, to_linear, &mut simd));
+                assert!(write_row16_f16(avx512f, &row_a, &row_b, to_linear, &mut simd));
 
                 for (lane, &value) in row_a.iter().chain(row_b.iter()).enumerate() {
                     let expected = scalar_linear_bits(value, to_linear);
@@ -539,11 +545,11 @@ mod test {
 
     #[test]
     fn write_row16_f32_matches_scalar() {
-        let v4 = expect_avx512();
+        let avx512f = expect_avx512();
         for to_linear in [None, Some(to_linear_table())] {
             for (row_a, row_b) in sweep_row_pairs() {
                 let mut simd = [0u8; 64];
-                assert!(write_row16_f32(v4, &row_a, &row_b, to_linear, &mut simd));
+                assert!(write_row16_f32(avx512f, &row_a, &row_b, to_linear, &mut simd));
 
                 for (lane, &value) in row_a.iter().chain(row_b.iter()).enumerate() {
                     let expected = f16::from_bits(scalar_linear_bits(value, to_linear)).to_f32();
@@ -574,9 +580,8 @@ mod test {
     /// the same way, on top of the row-level bit-exactness above.
     #[test]
     fn write_pair_block_matches_two_write_block_calls() {
-        let v4 = expect_avx512();
-        let v3: V3 = *v4;
-        let f16c = F16c::try_new().expect("F16C requested but unavailable");
+        let avx512f = expect_avx512();
+        let f16c = F16c::from_features(detect_features()).expect("F16C requested but unavailable");
 
         let width = 16usize;
         let height = 8usize;
@@ -597,20 +602,20 @@ mod test {
             let mut targets_pair =
                 [ScanlineTarget { sample_type: SampleType::F16, row_offsets: &row_offsets }];
             let err = write_pair_block(
-                v4, 0, 0, height, to_linear, &dct_a, &dct_b, &mut targets_pair, &mut out_pair,
+                avx512f, 0, 0, height, to_linear, &dct_a, &dct_b, &mut targets_pair, &mut out_pair,
             );
             assert!(err.is_none());
 
             let mut targets_two =
                 [ScanlineTarget { sample_type: SampleType::F16, row_offsets: &row_offsets }];
             let err = write_block(
-                v3, f16c, 0, 0, 8, height, to_linear, &dct_a, &mut targets_two, &mut out_two,
+                f16c, 0, 0, 8, height, to_linear, &dct_a, &mut targets_two, &mut out_two,
             );
             assert!(err.is_none());
             let mut targets_two =
                 [ScanlineTarget { sample_type: SampleType::F16, row_offsets: &row_offsets }];
             let err = write_block(
-                v3, f16c, 1, 0, 8, height, to_linear, &dct_b, &mut targets_two, &mut out_two,
+                f16c, 1, 0, 8, height, to_linear, &dct_b, &mut targets_two, &mut out_two,
             );
             assert!(err.is_none());
 

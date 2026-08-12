@@ -22,24 +22,39 @@ fn main() {
 mod bench {
     use std::time::Instant;
 
-    use exr::compression::dwa::discrete_cosine_transform::{test, x86::avx512};
-    use pulp::x86::V4;
+    use exr::compression::dwa::discrete_cosine_transform::{test, x86::avx512dq as avx512};
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
+    use miraculix::x86::ops::avx512::avx512dq::Avx512Dq;
+    use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
     const PAIR_COUNT: usize = 2048;
     const WARMUP: usize = 32;
     const RUNS: usize = 61; // odd -> clean median
     const INNER: usize = 4; // invert same buffer INNER times per sample (amortize noise)
 
+    #[derive(Clone, Copy)]
+    struct Tokens {
+        avx512f: Avx512f,
+        avx: Avx,
+        avx512dq: Avx512Dq,
+    }
+
     pub(super) fn main() {
-        let v4 = V4::try_new().expect("host needs AVX-512 (V4) for this microbench");
+        let features = detect_features();
+        let tokens = Tokens {
+            avx512f: Avx512f::from_features(features).expect("host needs AVX-512F for this microbench"),
+            avx: Avx::from_features(features).expect("host needs AVX for this microbench"),
+            avx512dq: Avx512Dq::from_features(features).expect("host needs AVX-512DQ for this microbench"),
+        };
         let base = make_pairs(PAIR_COUNT);
 
         // Correctness smoke: one pass each, compare.
         {
             let mut seq = base.clone();
             let mut quad = base.clone();
-            avx512::dct_inverse_rgb_pair_components_seq(v4, &mut seq);
-            avx512::dct_inverse_rgb_pair_components_quad(v4, &mut quad);
+            avx512::dct_inverse_rgb_pair_components_seq(tokens.avx512f, tokens.avx, tokens.avx512dq, &mut seq);
+            avx512::dct_inverse_rgb_pair_components_quad(tokens.avx512f, tokens.avx, tokens.avx512dq, &mut quad);
             for (s, q) in seq.iter().zip(quad.iter()) {
                 for c in 0..3 {
                     assert_eq!(s.0[c], q.0[c], "component {c} block A mismatch");
@@ -55,8 +70,8 @@ mod bench {
         let mut quad_pairs = base.clone();
 
         for _ in 0..WARMUP {
-            avx512::dct_inverse_rgb_pair_components_seq(v4, &mut seq_pairs);
-            avx512::dct_inverse_rgb_pair_components_quad(v4, &mut quad_pairs);
+            avx512::dct_inverse_rgb_pair_components_seq(tokens.avx512f, tokens.avx, tokens.avx512dq, &mut seq_pairs);
+            avx512::dct_inverse_rgb_pair_components_quad(tokens.avx512f, tokens.avx, tokens.avx512dq, &mut quad_pairs);
         }
 
         // Reset to base so arithmetic stays in a normal float range after warmup
@@ -70,11 +85,11 @@ mod bench {
             // Alternate order; each sample times INNER back-to-back kernel calls
             // on an already-resident buffer (no clone inside the stopwatch).
             if i % 2 == 0 {
-                seq_ns.push(time_kernel(v4, &mut seq_pairs, Mode::Seq));
-                quad_ns.push(time_kernel(v4, &mut quad_pairs, Mode::Quad));
+                seq_ns.push(time_kernel(tokens, &mut seq_pairs, Mode::Seq));
+                quad_ns.push(time_kernel(tokens, &mut quad_pairs, Mode::Quad));
             } else {
-                quad_ns.push(time_kernel(v4, &mut quad_pairs, Mode::Quad));
-                seq_ns.push(time_kernel(v4, &mut seq_pairs, Mode::Seq));
+                quad_ns.push(time_kernel(tokens, &mut quad_pairs, Mode::Quad));
+                seq_ns.push(time_kernel(tokens, &mut seq_pairs, Mode::Seq));
             }
         }
 
@@ -143,12 +158,16 @@ mod bench {
         Quad,
     }
 
-    fn time_kernel(v4: V4, pairs: &mut [avx512::RgbPairBlocks], mode: Mode) -> f64 {
+    fn time_kernel(tokens: Tokens, pairs: &mut [avx512::RgbPairBlocks], mode: Mode) -> f64 {
         let t0 = Instant::now();
         for _ in 0..INNER {
             match mode {
-                Mode::Seq => avx512::dct_inverse_rgb_pair_components_seq(v4, pairs),
-                Mode::Quad => avx512::dct_inverse_rgb_pair_components_quad(v4, pairs),
+                Mode::Seq => {
+                    avx512::dct_inverse_rgb_pair_components_seq(tokens.avx512f, tokens.avx, tokens.avx512dq, pairs)
+                }
+                Mode::Quad => {
+                    avx512::dct_inverse_rgb_pair_components_quad(tokens.avx512f, tokens.avx, tokens.avx512dq, pairs)
+                }
             }
             std::hint::black_box(&*pairs);
         }

@@ -55,21 +55,21 @@ mod avx2_tests {
     use miraculix::x86::ops::avx::avx::Avx;
 
     use super::{
-        super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::avx2},
+        super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::avx},
         assert_blocks_match,
     };
 
     #[test]
     fn avx2_forward_matches_autovectorized() {
         assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            avx2::csc709_forward_8x8(expect_avx(), data)
+            avx::csc709_forward_8x8(expect_avx(), data)
         });
     }
 
     #[test]
     fn avx2_inverse_matches_autovectorized() {
         assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            avx2::csc709_inverse_8x8(expect_avx(), data)
+            avx::csc709_inverse_8x8(expect_avx(), data)
         });
     }
 
@@ -86,7 +86,7 @@ mod avx512_tests {
     use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
     use super::{
-        super::{csc709_inverse_8x8_autovectorized, x86::avx512},
+        super::{csc709_inverse_8x8_autovectorized, x86::avx512f},
         pseudo_random_triplets,
     };
     use crate::image::validate_results::ValidateResult;
@@ -115,7 +115,7 @@ mod avx512_tests {
 
     #[test]
     fn avx512_inverse_matches_autovectorized() {
-        assert_pairs_match(|a, b| avx512::csc709_inverse_8x8_pair(expect_avx512(), a, b));
+        assert_pairs_match(|a, b| avx512f::csc709_inverse_8x8_pair(expect_avx512(), a, b));
     }
 
     fn expect_avx512() -> Avx512f {
@@ -132,21 +132,21 @@ mod sse2_tests {
     use miraculix::x86::ops::sse::sse::Sse;
 
     use super::{
-        super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::sse2},
+        super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::sse},
         assert_blocks_match,
     };
 
     #[test]
     fn assert_sse2_forward_close_to_autovectorized_reference() {
         assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            sse2::csc709_forward_8x8(expect_sse_without_avx(), data)
+            sse::csc709_forward_8x8(expect_sse_without_avx(), data)
         });
     }
 
     #[test]
     fn assert_sse2_inverse_close_to_autovectorized_reference() {
         assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            sse2::csc709_inverse_8x8(expect_sse_without_avx(), data)
+            sse::csc709_inverse_8x8(expect_sse_without_avx(), data)
         });
     }
 

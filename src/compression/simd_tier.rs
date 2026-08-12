@@ -56,75 +56,25 @@ pub fn cap_name() -> &'static str {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod x86 {
-    use super::{Tier, cap};
-    use pulp::core_arch::x86::F16c;
-    use pulp::x86::{V1, V3, V4};
-
-    /// `V1::try_new()`, unless the process is capped below the SSE tier.
-    ///
-    /// Still pulp - only [`super::super::dwa::color_space_conversion`],
-    /// [`super::super::dwa::discrete_cosine_transform`], and
-    /// [`super::super::dwa::lossy_dct`] use this rung; `optimize_bytes` was
-    /// ported to miraculix's [`miraculix_x86::sse2`]/[`miraculix_x86::ssse3`]
-    /// below (see `notes/miraculix/TODO.md`).
-    #[inline(always)]
-    pub(crate) fn v1() -> Option<V1> {
-        if cap() >= Tier::Sse {
-            V1::try_new()
-        } else {
-            None
-        }
-    }
-
-    /// `V3::try_new()`, unless the process is capped below the AVX2 tier.
-    /// Still pulp, see [`v1`]'s doc.
-    #[inline(always)]
-    pub(crate) fn v3() -> Option<V3> {
-        if cap() >= Tier::Avx2 {
-            V3::try_new()
-        } else {
-            None
-        }
-    }
-
-    /// `V4::try_new()`, unless the process is capped below the AVX-512 tier.
-    /// Still pulp, see [`v1`]'s doc.
-    #[inline(always)]
-    pub(crate) fn v4() -> Option<V4> {
-        if cap() >= Tier::Avx512 {
-            V4::try_new()
-        } else {
-            None
-        }
-    }
-
-    /// `F16c::try_new()`. Capped with `V3` rather than on its own: exrs never
-    /// uses F16C without an accompanying `V3` token, so letting it survive into
-    /// the SSE tier would describe a configuration the crate cannot actually
-    /// run. Still pulp, see [`v1`]'s doc.
-    #[inline(always)]
-    pub(crate) fn f16c() -> Option<F16c> {
-        if cap() >= Tier::Avx2 {
-            F16c::try_new()
-        } else {
-            None
-        }
-    }
-
     pub(crate) mod miraculix_x86 {
         use miraculix::x86::detect_features;
         use miraculix::x86::ops::avx::avx::Avx;
         use miraculix::x86::ops::avx::avx2::Avx2;
+        use miraculix::x86::ops::avx::f16c::F16c;
         use miraculix::x86::ops::avx512::avx512bw::Avx512Bw;
+        use miraculix::x86::ops::avx512::avx512dq::Avx512Dq;
         use miraculix::x86::ops::avx512::avx512f::Avx512f;
         use miraculix::x86::ops::sse::sse::Sse;
         use miraculix::x86::ops::sse::sse2::Sse2;
+        use miraculix::x86::ops::sse::sse41::Sse41;
         use miraculix::x86::ops::sse::ssse3::Ssse3;
 
         use super::super::{Tier, cap};
 
         /// Base SSE token (f32 ops only), unless the process is capped below
-        /// the SSE tier. (WIT))
+        /// the SSE tier. `color_space_conversion`'s and
+        /// `discrete_cosine_transform`'s SSE-tier kernels only ever touch
+        /// `f32` arithmetic, so they need this rather than [`sse2`].
         #[inline(always)]
         pub(crate) fn sse() -> Option<Sse> {
             if cap() >= Tier::Sse {
@@ -155,6 +105,32 @@ pub(crate) mod x86 {
             }
         }
 
+        /// SSE4.1 token, capped at the AVX2 tier rather than its own lower
+        /// `Tier::Sse` rung: `lossy_dct`'s zigzag-unpack kernel only ever
+        /// reaches for this alongside an AVX2-tier ([`f16c`]) kernel, same
+        /// rationale already established for [`avx`].
+        #[inline(always)]
+        pub(crate) fn sse41() -> Option<Sse41> {
+            if cap() >= Tier::Avx2 {
+                Sse41::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// F16C token, unless the process is capped below the AVX2 tier.
+        /// Capped with AVX2 rather than its own lower rung for the same
+        /// reason [`avx`]/[`sse41`] are: exrs never uses F16C without an
+        /// accompanying AVX2-tier kernel.
+        #[inline(always)]
+        pub(crate) fn f16c() -> Option<F16c> {
+            if cap() >= Tier::Avx2 {
+                F16c::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
         /// AVX2 token, unless the process is capped below the AVX2 tier.
         #[inline(always)]
         pub(crate) fn avx2() -> Option<Avx2> {
@@ -166,7 +142,9 @@ pub(crate) mod x86 {
         }
 
         /// Base AVX token (f32 ops only), capped at the AVX2 tier rather
-        /// than its own (WIT)
+        /// than its own lower `Tier::Sse` rung: exrs only ever reaches for
+        /// this alongside an AVX2-tier kernel (same rationale already
+        /// established for [`super::f16c`]).
         #[inline(always)]
         pub(crate) fn avx() -> Option<Avx> {
             if cap() >= Tier::Avx2 {
@@ -177,7 +155,8 @@ pub(crate) mod x86 {
         }
 
         /// AVX-512F token, unless the process is capped below the AVX-512
-        /// tier. Pairs with [`avx512bw`] for the AVX-512-tier kernels.
+        /// tier. Pairs with [`avx512bw`]/[`avx512dq`] for the AVX-512-tier
+        /// kernels.
         #[inline(always)]
         pub(crate) fn avx512f() -> Option<Avx512f> {
             if cap() >= Tier::Avx512 {
@@ -193,6 +172,19 @@ pub(crate) mod x86 {
         pub(crate) fn avx512bw() -> Option<Avx512Bw> {
             if cap() >= Tier::Avx512 {
                 Avx512Bw::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// AVX-512DQ token, unless the process is capped below the AVX-512
+        /// tier. `discrete_cosine_transform`'s AVX-512 tier needs this for
+        /// its `extract_f32x8_from_x16`/`insert_f32x8_into_x16` transpose
+        /// recombine step (`vextractf32x8`/`vinsertf32x8`, DQ-only).
+        #[inline(always)]
+        pub(crate) fn avx512dq() -> Option<Avx512Dq> {
+            if cap() >= Tier::Avx512 {
+                Avx512Dq::from_features(detect_features())
             } else {
                 None
             }

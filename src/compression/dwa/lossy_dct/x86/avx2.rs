@@ -7,13 +7,15 @@ use std::convert::TryInto;
 
 use half::f16;
 use miraculix::x86::ops::avx::avx::Avx;
-use pulp::core_arch::x86::F16c;
-use pulp::x86::V3;
+use miraculix::x86::ops::avx::f16c::F16c;
+use miraculix::x86::ops::sse::sse2::Sse2;
+use miraculix::x86::ops::sse::sse41::Sse41;
+use miraculix::x86::ops::sse::ssse3::Ssse3;
 
 use crate::{
     compression::dwa::{
         color_space_conversion,
-        discrete_cosine_transform::{self, x86::avx2 as dct_avx2},
+        discrete_cosine_transform::{self, x86::avx as dct_avx2},
     },
     error::{Error, Result as ExrResult},
     meta::attribute::SampleType,
@@ -26,8 +28,11 @@ use super::ROUND_TO_NEAREST;
 /// tracks which components still need a real iDCT vs. already being filled
 /// in by the DC-only fast path. Shared by the AVX2 and AVX-512 fused paths.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn zigzag_block(
-    v3: V3,
+    sse2: Sse2,
+    ssse3: Ssse3,
+    sse41: Sse41,
     f16c: F16c,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
@@ -53,7 +58,7 @@ pub(super) fn zigzag_block(
             needs_inverse[component] = false;
         } else {
             // Tokens already probed above; call the kernel directly.
-            from_half_zigzag(v3, f16c, &zig_block, dct_block);
+            from_half_zigzag(sse2, ssse3, sse41, f16c, &zig_block, dct_block);
             needs_inverse[component] = true;
         }
     }
@@ -64,7 +69,6 @@ pub(super) fn zigzag_block(
 /// block to its scanline target(s). Shared the same way as `zigzag_block`.
 #[inline(always)]
 pub(super) fn write_block(
-    v3: V3,
     f16c: F16c,
     block_x: usize,
     block_y: usize,
@@ -85,8 +89,8 @@ pub(super) fn write_block(
             let out_row = &mut out[offset..][..x_count * bytes_per_sample];
 
             let handled = match target.sample_type {
-                SampleType::F16 => write_row_f16(v3, f16c, row, to_linear, out_row),
-                SampleType::F32 => write_row_f32(v3, f16c, row, to_linear, out_row),
+                SampleType::F16 => write_row_f16(f16c, row, to_linear, out_row),
+                SampleType::F32 => write_row_f32(f16c, row, to_linear, out_row),
                 SampleType::U32 => false,
             };
             if handled {
@@ -120,9 +124,12 @@ pub(super) fn write_block(
 
 /// For each spatial 8x8, finish unRLE -> zigzag -> iDCT -> CSC -> scanline
 /// write before touching the next block. Caller (`x86::mod`) has already
-/// confirmed `v3`/`f16c`/`avx` are available.
+/// confirmed the tokens below are available.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decode_group_fused(
-    v3: V3,
+    sse2: Sse2,
+    ssse3: Ssse3,
+    sse41: Sse41,
     f16c: F16c,
     avx: Avx,
     ac: &mut PackedStream<'_>,
@@ -154,7 +161,9 @@ pub(super) fn decode_group_fused(
             let x_count = 8.min(width - block_x * 8);
 
             zigzag_block(
-                v3,
+                sse2,
+                ssse3,
+                sse41,
                 f16c,
                 ac,
                 dc,
@@ -165,28 +174,15 @@ pub(super) fn decode_group_fused(
                 &mut needs_inverse,
             )?;
 
-            // One trampoline for this spatial block: iDCT every component that
-            // needs it, optional CSC, then write. Keeps the 768 B block set hot
-            // end-to-end instead of reloading a multi-block strip four times.
-            let mut write_err: Option<Error> = None;
-            v3.vectorize(|| {
-                let coef = dct_avx2::Coefficients::new(v3);
-                for component in 0..components {
-                    if needs_inverse[component] {
-                        dct_avx2::inverse_one(v3, &coef, &mut dct_blocks[component]);
-                    }
-                }
-
-                if components == 3 {
-                    color_space_conversion::x86::avx2::inverse_one(avx, &mut dct_blocks);
-                }
-
-                write_err = write_block(
-                    v3, f16c, block_x, block_y, x_count, y_count, to_linear, &dct_blocks, targets,
-                    out,
-                );
-            });
-            if let Some(err) = write_err {
+            // iDCT every component that needs it, optional CSC, then write.
+            // Keeps the 768 B block set hot end-to-end instead of reloading a
+            // multi-block strip four times. Extracted into
+            // `decode_one_block_dct_csc_write` so `miraculix::avx_fn!` can
+            // wrap the whole thing -- see that function's doc.
+            if let Some(err) = decode_one_block_dct_csc_write(
+                f16c, avx, components, &needs_inverse, &mut dct_blocks, block_x, block_y, x_count,
+                y_count, to_linear, targets, out,
+            ) {
                 return Err(err);
             }
         }
@@ -194,6 +190,45 @@ pub(super) fn decode_group_fused(
 
     dc.advance(components * block_count);
     Ok(())
+}
+
+// One spatial block's iDCT + optional CSC + write, extracted so
+// `miraculix::avx_fn!` can wrap the whole thing: `inverse_one` alone
+// composes 2 register transposes plus the row/column-pass butterfly
+// (dozens of chained token-method calls) that need a shared
+// `#[target_feature]` context to inline into real `ymm` code instead of a
+// `callq` chain -- see `discrete_cosine_transform::x86::avx::
+// dct_inverse_8x8_batch`'s doc for the `llvm-objdump` finding that caught
+// this.
+miraculix::avx_fn! {
+    #[allow(clippy::too_many_arguments)]
+    fn decode_one_block_dct_csc_write(
+        f16c: F16c,
+        avx: Avx,
+        components: usize,
+        needs_inverse: &[bool; 3],
+        dct_blocks: &mut [[f32; 64]; 3],
+        block_x: usize,
+        block_y: usize,
+        x_count: usize,
+        y_count: usize,
+        to_linear: Option<&[u16; 65536]>,
+        targets: &mut [ScanlineTarget<'_>],
+        out: &mut [u8],
+    ) -> Option<Error> {
+        let coef = dct_avx2::Coefficients::new(avx);
+        for component in 0..components {
+            if needs_inverse[component] {
+                dct_avx2::inverse_one(avx, &coef, &mut dct_blocks[component]);
+            }
+        }
+
+        if components == 3 {
+            color_space_conversion::x86::avx::inverse_one(avx, dct_blocks);
+        }
+
+        write_block(f16c, block_x, block_y, x_count, y_count, to_linear, dct_blocks, targets, out)
+    }
 }
 
 #[inline(always)]
@@ -205,208 +240,248 @@ fn linearize_scalar(value: f32, to_linear: Option<&[u16; 65536]>) -> f16 {
     }
 }
 
-/// Vectorized version of `decode_lossy_dct_group`'s F16-output write-row
-/// loop for a full 8-wide row.
+/// Per-lane `to_linear` table gather. Unlike the pre-port pulp code (whose
+/// `__m128i` register had no per-lane indexing and needed a GPR
+/// extract/lookup/insert roundtrip), a miraculix register *is* a plain
+/// `[u16; N]` array, so the gather is just array indexing -- no SIMD op at
+/// any width, shared unchanged by every write-row variant below (8- and
+/// 16-lane alike).
 #[inline(always)]
-pub(super) fn write_row_f16(
-    v3: V3,
-    f16c: F16c,
-    row: &[f32],
-    to_linear: Option<&[u16; 65536]>,
-    out_row: &mut [u8],
-) -> bool {
-    let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
-        return false;
-    };
-    if out_row.len() != 16 {
-        return false;
-    }
-    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
-    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
-    let linear = match to_linear {
-        Some(table) => linearize_lanes(v3.sse2, nonlinear, table),
-        None => nonlinear,
-    };
-    let bytes: [u8; 16] = pulp::cast!(linear);
-    out_row.copy_from_slice(&bytes);
-    true
+pub(super) fn linearize_lanes<const N: usize>(bits: [u16; N], table: &[u16; 65536]) -> [u16; N] {
+    std::array::from_fn(|i| table[bits[i] as usize])
 }
 
-/// Same as `write_row_f16`, but widens the linearized halves back to f32
-/// (via a second `vcvtph2ps`) for F32-sample-type channels, matching the
-/// scalar path's `linear.to_f32()`.
+// Vectorized version of `decode_lossy_dct_group`'s F16-output write-row
+// loop for a full 8-wide row.
+miraculix::f16c_fn! {
+    pub(super) fn write_row_f16(
+        f16c: F16c,
+        row: &[f32],
+        to_linear: Option<&[u16; 65536]>,
+        out_row: &mut [u8],
+    ) -> bool {
+        let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
+            return false;
+        };
+        if out_row.len() != 16 {
+            return false;
+        }
+        let nonlinear = f16c.f32_to_f16x8::<ROUND_TO_NEAREST>(row);
+        let linear = match to_linear {
+            Some(table) => linearize_lanes(nonlinear, table),
+            None => nonlinear,
+        };
+        for (chunk, &half) in out_row.chunks_exact_mut(2).zip(linear.iter()) {
+            chunk.copy_from_slice(&half.to_le_bytes());
+        }
+        true
+    }
+}
+
+// Same as `write_row_f16`, but widens the linearized halves back to f32
+// (via a second `vcvtph2ps`) for F32-sample-type channels, matching the
+// scalar path's `linear.to_f32()`.
+miraculix::f16c_fn! {
+    pub(super) fn write_row_f32(
+        f16c: F16c,
+        row: &[f32],
+        to_linear: Option<&[u16; 65536]>,
+        out_row: &mut [u8],
+    ) -> bool {
+        let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
+            return false;
+        };
+        if out_row.len() != 32 {
+            return false;
+        }
+        let nonlinear = f16c.f32_to_f16x8::<ROUND_TO_NEAREST>(row);
+        let linear = match to_linear {
+            Some(table) => linearize_lanes(nonlinear, table),
+            None => nonlinear,
+        };
+        let widened = f16c.f16_to_f32x8(linear);
+        for (chunk, &value) in out_row.chunks_exact_mut(4).zip(widened.iter()) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        true
+    }
+}
+
+/// Bit-reinterprets a 128-bit register's raw bytes at a different lane
+/// width. Register-shuffle stages below move data between `i16x8`/`i32x4`/
+/// `i64x2`/`u8x16` views of the *same* 16 bytes (x86 SIMD registers have no
+/// fixed element type at the hardware level); these helpers make that
+/// explicit and are the only non-`unsafe` way to express it without
+/// violating this crate's `#![forbid(unsafe_code)]`.
 #[inline(always)]
-pub(super) fn write_row_f32(
-    v3: V3,
-    f16c: F16c,
-    row: &[f32],
-    to_linear: Option<&[u16; 65536]>,
-    out_row: &mut [u8],
-) -> bool {
-    let Ok(&row) = TryInto::<&[f32; 8]>::try_into(row) else {
-        return false;
-    };
-    if out_row.len() != 32 {
-        return false;
+fn i16x8_from_u8x16(v: [u8; 16]) -> [i16; 8] {
+    std::array::from_fn(|i| i16::from_le_bytes([v[i * 2], v[i * 2 + 1]]))
+}
+
+#[inline(always)]
+fn u8x16_from_i16x8(v: [i16; 8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for i in 0..8 {
+        out[i * 2..i * 2 + 2].copy_from_slice(&v[i].to_le_bytes());
     }
-    let vec: std::arch::x86_64::__m256 = pulp::cast!(row);
-    let nonlinear = f16c._mm256_cvtps_ph::<ROUND_TO_NEAREST>(vec);
-    let linear = match to_linear {
-        Some(table) => linearize_lanes(v3.sse2, nonlinear, table),
-        None => nonlinear,
-    };
-    let widened = f16c._mm256_cvtph_ps(linear);
-    let bytes: [u8; 32] = pulp::cast!(widened);
-    out_row.copy_from_slice(&bytes);
-    true
+    out
 }
 
-// Mirrors OpenEXR's `LossyDctDecoder_execute` SSE2 fast path
-// (internal_dwa_decoder.h): one `vcvtps2ph` converts a full 8-wide row of DCT
-// output to nonlinear half bits (matching `half::f16::from_f32`'s own F16C
-// path bit-for-bit), each lane is extracted to a GPR to index `to_linear`
-// (an AVX-512F 16-lane row does the same thing twice -- see `avx512.rs`).
-//
-// Takes the raw `Sse2` capability, not a whole tier struct: this function
-// only ever touches `.sse2`, and the true-SSE2-only `sse2.rs` write-row
-// (no F16C, no AVX2) needs to call it too.
-pub(super) fn linearize_lanes(
-    sse2: pulp::core_arch::x86::Sse2,
-    bits: std::arch::x86_64::__m128i,
-    to_linear: &[u16; 65536],
-) -> std::arch::x86_64::__m128i {
-    let i0 = sse2._mm_extract_epi16::<0>(bits);
-    let i1 = sse2._mm_extract_epi16::<1>(bits);
-    let i2 = sse2._mm_extract_epi16::<2>(bits);
-    let i3 = sse2._mm_extract_epi16::<3>(bits);
-    let i4 = sse2._mm_extract_epi16::<4>(bits);
-    let i5 = sse2._mm_extract_epi16::<5>(bits);
-    let i6 = sse2._mm_extract_epi16::<6>(bits);
-    let i7 = sse2._mm_extract_epi16::<7>(bits);
-
-    // `_mm_extract_epi16` zero-extends, so each `iN` is already a valid
-    // 0..=65535 table index.
-    let r0 = to_linear[i0 as usize] as i32;
-    let r1 = to_linear[i1 as usize] as i32;
-    let r2 = to_linear[i2 as usize] as i32;
-    let r3 = to_linear[i3 as usize] as i32;
-    let r4 = to_linear[i4 as usize] as i32;
-    let r5 = to_linear[i5 as usize] as i32;
-    let r6 = to_linear[i6 as usize] as i32;
-    let r7 = to_linear[i7 as usize] as i32;
-
-    let v = sse2._mm_insert_epi16::<0>(sse2._mm_setzero_si128(), r0);
-    let v = sse2._mm_insert_epi16::<1>(v, r1);
-    let v = sse2._mm_insert_epi16::<2>(v, r2);
-    let v = sse2._mm_insert_epi16::<3>(v, r3);
-    let v = sse2._mm_insert_epi16::<4>(v, r4);
-    let v = sse2._mm_insert_epi16::<5>(v, r5);
-    let v = sse2._mm_insert_epi16::<6>(v, r6);
-    let v = sse2._mm_insert_epi16::<7>(v, r7);
-    v
+#[inline(always)]
+fn i32x4_from_i16x8(v: [i16; 8]) -> [i32; 4] {
+    std::array::from_fn(|i| {
+        let lo = v[i * 2] as u16 as u32;
+        let hi = v[i * 2 + 1] as u16 as u32;
+        (lo | (hi << 16)) as i32
+    })
 }
 
-pub(super) fn from_half_zigzag(v3: V3, f16c: F16c, src: &[u16; 64], dst: &mut [f32; 64]) {
-    let sse2 = v3.sse2;
-    let ssse3 = v3.ssse3;
-    let sse4_1 = v3.sse4_1;
+#[inline(always)]
+fn i16x8_from_i32x4(v: [i32; 4]) -> [i16; 8] {
+    std::array::from_fn(|i| {
+        let word = v[i / 2] as u32;
+        (if i % 2 == 0 { word } else { word >> 16 }) as u16 as i16
+    })
+}
 
-    let e = |i: usize| src[i] as i16;
-    let setr = |a: usize, b: usize, c: usize, d: usize, f: usize, g: usize, h: usize, i: usize| {
-        sse2._mm_setr_epi16(e(a), e(b), e(c), e(d), e(f), e(g), e(h), e(i))
-    };
+#[inline(always)]
+fn i64x2_from_i32x4(v: [i32; 4]) -> [i64; 2] {
+    std::array::from_fn(|i| {
+        let lo = v[i * 2] as u32 as u64;
+        let hi = v[i * 2 + 1] as u32 as u64;
+        (lo | (hi << 32)) as i64
+    })
+}
 
-    // x8 <- [0-7]; x6 <- [56-63]; x9 <- [21-28]; x7 <- [28-35]; x3 <- [6-9,54-57]
-    let xmm8 = setr(0, 1, 2, 3, 4, 5, 6, 7);
-    let xmm6_init = setr(56, 57, 58, 59, 60, 61, 62, 63);
-    let xmm9 = setr(21, 22, 23, 24, 25, 26, 27, 28);
-    let xmm7 = setr(28, 29, 30, 31, 32, 33, 34, 35);
-    let xmm3 = setr(6, 7, 8, 9, 54, 55, 56, 57);
+#[inline(always)]
+fn u8x16_from_i64x2(v: [i64; 2]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for i in 0..2 {
+        out[i * 8..i * 8 + 8].copy_from_slice(&v[i].to_le_bytes());
+    }
+    out
+}
 
-    let mem70 = setr(35, 36, 37, 38, 39, 40, 41, 42);
-    let mem82 = setr(41, 42, 43, 44, 45, 46, 47, 48);
-    let mem98 = setr(49, 50, 51, 52, 53, 54, 55, 56);
-    let mem14 = setr(7, 8, 9, 10, 11, 12, 13, 14);
-    let mem30 = setr(15, 16, 17, 18, 19, 20, 21, 22);
+#[inline(always)]
+fn u16x8_from_u8x16(v: [u8; 16]) -> [u16; 8] {
+    std::array::from_fn(|i| u16::from_le_bytes([v[i * 2], v[i * 2 + 1]]))
+}
 
-    // Setup rows 0-2 of A in xmm0-xmm2
-    let xmm1 = sse2._mm_srli_si128::<2>(xmm8);
-    let xmm2 = sse2._mm_slli_si128::<4>(xmm8);
-    let xmm0 = ssse3._mm_alignr_epi8::<2>(xmm8, mem70);
-    let xmm1 = sse4_1._mm_blend_epi16::<0xfc>(xmm1, mem82);
-    let xmm2 = sse4_1._mm_blend_epi16::<0x1f>(xmm2, mem98);
+// OpenEXR's `fromHalfZigZag_f16c`: unRLE has already produced 64 zigzag-order
+// half-float bit patterns; this un-zigzags them into row-major order and
+// widens to f32 in one pass, via a 3-stage (word/dword/qword) register
+// transpose + a handful of `pshuflw`/`pshufhw`/`pshufd`/`palignr`/`pblendw`
+// fixups, rather than 64 independent scalar loads. Ported 1:1
+// intrinsic-for-intrinsic from the original SSE/SSSE3/SSE4.1/F16C sequence
+// (see `test::zigzag_simd_matches_scalar` for the bit-exact oracle) -- not a
+// place to redesign, the shuffle network's shape is exactly what OpenEXR
+// measured to beat a plain gather.
+miraculix::sse41_f16c_fn! {
+    pub(super) fn from_half_zigzag(
+        sse2: Sse2,
+        ssse3: Ssse3,
+        sse41: Sse41,
+        f16c: F16c,
+        src: &[u16; 64],
+        dst: &mut [f32; 64],
+    ) {
+        let e = |i: usize| src[i] as i16;
+        let setr = |a: usize, b: usize, c: usize, d: usize, f: usize, g: usize, h: usize, i: usize| -> [i16; 8] {
+            [e(a), e(b), e(c), e(d), e(f), e(g), e(h), e(i)]
+        };
 
-    // Setup rows 4-6 of A in xmm4-xmm6
-    let xmm4 = sse2._mm_srli_si128::<4>(xmm6_init);
-    let xmm5 = sse2._mm_slli_si128::<2>(xmm6_init);
-    let xmm6 = ssse3._mm_alignr_epi8::<14>(xmm9, xmm6_init);
-    let xmm4 = sse4_1._mm_blend_epi16::<0xf8>(xmm4, mem14);
-    let xmm5 = sse4_1._mm_blend_epi16::<0x3f>(xmm5, mem30);
+        // x8 <- [0-7]; x6 <- [56-63]; x9 <- [21-28]; x7 <- [28-35]; x3 <- [6-9,54-57]
+        let xmm8 = setr(0, 1, 2, 3, 4, 5, 6, 7);
+        let xmm6_init = setr(56, 57, 58, 59, 60, 61, 62, 63);
+        let xmm9 = setr(21, 22, 23, 24, 25, 26, 27, 28);
+        let xmm7 = setr(28, 29, 30, 31, 32, 33, 34, 35);
+        let xmm3 = setr(6, 7, 8, 9, 54, 55, 56, 57);
 
-    // Reverse the even rows (pshuflw+pshufhw+pshufd with 0x1b/0x1b/0x4e is a
-    // full 8-lane reversal, confirmed by hand-tracing the immediate fields).
-    let reverse = |v: std::arch::x86_64::__m128i| {
-        let v = sse2._mm_shufflelo_epi16::<0x1b>(v);
-        let v = sse2._mm_shufflehi_epi16::<0x1b>(v);
-        sse2._mm_shuffle_epi32::<0x4e>(v)
-    };
-    let xmm0 = reverse(xmm0);
-    let xmm2 = reverse(xmm2);
-    let xmm4 = reverse(xmm4);
-    let xmm6 = reverse(xmm6);
+        let mem70 = setr(35, 36, 37, 38, 39, 40, 41, 42);
+        let mem82 = setr(41, 42, 43, 44, 45, 46, 47, 48);
+        let mem98 = setr(49, 50, 51, 52, 53, 54, 55, 56);
+        let mem14 = setr(7, 8, 9, 10, 11, 12, 13, 14);
+        let mem30 = setr(15, 16, 17, 18, 19, 20, 21, 22);
 
-    // Transpose xmm0-xmm7 into xmm8-xmm15 (word stage)
-    let t8 = sse2._mm_unpacklo_epi16(xmm0, xmm1);
-    let t9 = sse2._mm_unpacklo_epi16(xmm2, xmm3);
-    let t10 = sse2._mm_unpacklo_epi16(xmm4, xmm5);
-    let t11 = sse2._mm_unpacklo_epi16(xmm6, xmm7);
-    let t12 = sse2._mm_unpackhi_epi16(xmm0, xmm1);
-    let t13 = sse2._mm_unpackhi_epi16(xmm2, xmm3);
-    let t14 = sse2._mm_unpackhi_epi16(xmm4, xmm5);
-    let t15 = sse2._mm_unpackhi_epi16(xmm6, xmm7);
+        // Setup rows 0-2 of A in xmm0-xmm2
+        let xmm1 = i16x8_from_u8x16(sse2.srli_u8x16::<2>(u8x16_from_i16x8(xmm8)));
+        let xmm2 = i16x8_from_u8x16(sse2.slli_u8x16::<4>(u8x16_from_i16x8(xmm8)));
+        let xmm0 = i16x8_from_u8x16(ssse3.alignr_u8x16::<2>(u8x16_from_i16x8(xmm8), u8x16_from_i16x8(mem70)));
+        let xmm1 = sse41.blend_i16x8::<0xfc>(xmm1, mem82);
+        let xmm2 = sse41.blend_i16x8::<0x1f>(xmm2, mem98);
 
-    // dword stage
-    let u0 = sse2._mm_unpacklo_epi32(t8, t9);
-    let u1 = sse2._mm_unpacklo_epi32(t10, t11);
-    let u2 = sse2._mm_unpackhi_epi32(t8, t9);
-    let u3 = sse2._mm_unpackhi_epi32(t10, t11);
-    let u4 = sse2._mm_unpacklo_epi32(t12, t13);
-    let u5 = sse2._mm_unpacklo_epi32(t14, t15);
-    let u6 = sse2._mm_unpackhi_epi32(t12, t13);
-    let u7 = sse2._mm_unpackhi_epi32(t14, t15);
+        // Setup rows 4-6 of A in xmm4-xmm6
+        let xmm4 = i16x8_from_u8x16(sse2.srli_u8x16::<4>(u8x16_from_i16x8(xmm6_init)));
+        let xmm5 = i16x8_from_u8x16(sse2.slli_u8x16::<2>(u8x16_from_i16x8(xmm6_init)));
+        let xmm6 =
+            i16x8_from_u8x16(ssse3.alignr_u8x16::<14>(u8x16_from_i16x8(xmm9), u8x16_from_i16x8(xmm6_init)));
+        let xmm4 = sse41.blend_i16x8::<0xf8>(xmm4, mem14);
+        let xmm5 = sse41.blend_i16x8::<0x3f>(xmm5, mem30);
 
-    // qword stage
-    let v8 = sse2._mm_unpacklo_epi64(u0, u1);
-    let v9 = sse2._mm_unpackhi_epi64(u0, u1);
-    let v10 = sse2._mm_unpacklo_epi64(u2, u3);
-    let v11 = sse2._mm_unpackhi_epi64(u2, u3);
-    let v12 = sse2._mm_unpacklo_epi64(u5, u4);
-    let v13 = sse2._mm_unpackhi_epi64(u4, u5);
-    let v14 = sse2._mm_unpacklo_epi64(u6, u7);
-    let v15 = sse2._mm_unpackhi_epi64(u6, u7);
+        // Reverse the even rows (pshuflw+pshufhw+pshufd with 0x1b/0x1b/0x4e is a
+        // full 8-lane reversal, confirmed by hand-tracing the immediate fields).
+        let reverse = |v: [i16; 8]| -> [i16; 8] {
+            let v = sse2.shufflelo_i16x8::<0x1b>(v);
+            let v = sse2.shufflehi_i16x8::<0x1b>(v);
+            i16x8_from_i32x4(sse2.shuffle_i32x4::<0x4e>(i32x4_from_i16x8(v)))
+        };
+        let xmm0 = reverse(xmm0);
+        let xmm2 = reverse(xmm2);
+        let xmm4 = reverse(xmm4);
+        let xmm6 = reverse(xmm6);
 
-    // Rotate the rows to get the correct final order (v8, v12 need no rotation).
-    let v9 = ssse3._mm_alignr_epi8::<2>(v9, v9);
-    let v10 = ssse3._mm_alignr_epi8::<4>(v10, v10);
-    let v11 = ssse3._mm_alignr_epi8::<6>(v11, v11);
-    let v13 = ssse3._mm_alignr_epi8::<10>(v13, v13);
-    let v14 = ssse3._mm_alignr_epi8::<12>(v14, v14);
-    let v15 = ssse3._mm_alignr_epi8::<14>(v15, v15);
+        // Transpose xmm0-xmm7 into xmm8-xmm15 (word stage)
+        let t8 = sse2.unpacklo_i16x8(xmm0, xmm1);
+        let t9 = sse2.unpacklo_i16x8(xmm2, xmm3);
+        let t10 = sse2.unpacklo_i16x8(xmm4, xmm5);
+        let t11 = sse2.unpacklo_i16x8(xmm6, xmm7);
+        let t12 = sse2.unpackhi_i16x8(xmm0, xmm1);
+        let t13 = sse2.unpackhi_i16x8(xmm2, xmm3);
+        let t14 = sse2.unpackhi_i16x8(xmm4, xmm5);
+        let t15 = sse2.unpackhi_i16x8(xmm6, xmm7);
 
-    // Widen each permuted row of 8 halves to 8 f32 with a single `vcvtph2ps`,
-    // exactly as the OpenEXR original does.
-    let store8 = |reg: std::arch::x86_64::__m128i, out: &mut [f32]| {
-        let wide: [f32; 8] = pulp::cast!(f16c._mm256_cvtph_ps(reg));
-        out.copy_from_slice(&wide);
-    };
-    store8(v8, &mut dst[0..8]);
-    store8(v9, &mut dst[8..16]);
-    store8(v10, &mut dst[16..24]);
-    store8(v11, &mut dst[24..32]);
-    store8(v12, &mut dst[32..40]);
-    store8(v13, &mut dst[40..48]);
-    store8(v14, &mut dst[48..56]);
-    store8(v15, &mut dst[56..64]);
+        // dword stage
+        let u0 = sse2.unpacklo_i32x4(i32x4_from_i16x8(t8), i32x4_from_i16x8(t9));
+        let u1 = sse2.unpacklo_i32x4(i32x4_from_i16x8(t10), i32x4_from_i16x8(t11));
+        let u2 = sse2.unpackhi_i32x4(i32x4_from_i16x8(t8), i32x4_from_i16x8(t9));
+        let u3 = sse2.unpackhi_i32x4(i32x4_from_i16x8(t10), i32x4_from_i16x8(t11));
+        let u4 = sse2.unpacklo_i32x4(i32x4_from_i16x8(t12), i32x4_from_i16x8(t13));
+        let u5 = sse2.unpacklo_i32x4(i32x4_from_i16x8(t14), i32x4_from_i16x8(t15));
+        let u6 = sse2.unpackhi_i32x4(i32x4_from_i16x8(t12), i32x4_from_i16x8(t13));
+        let u7 = sse2.unpackhi_i32x4(i32x4_from_i16x8(t14), i32x4_from_i16x8(t15));
+
+        // qword stage
+        let v8 = sse2.unpacklo_i64x2(i64x2_from_i32x4(u0), i64x2_from_i32x4(u1));
+        let v9 = sse2.unpackhi_i64x2(i64x2_from_i32x4(u0), i64x2_from_i32x4(u1));
+        let v10 = sse2.unpacklo_i64x2(i64x2_from_i32x4(u2), i64x2_from_i32x4(u3));
+        let v11 = sse2.unpackhi_i64x2(i64x2_from_i32x4(u2), i64x2_from_i32x4(u3));
+        let v12 = sse2.unpacklo_i64x2(i64x2_from_i32x4(u5), i64x2_from_i32x4(u4));
+        let v13 = sse2.unpackhi_i64x2(i64x2_from_i32x4(u4), i64x2_from_i32x4(u5));
+        let v14 = sse2.unpacklo_i64x2(i64x2_from_i32x4(u6), i64x2_from_i32x4(u7));
+        let v15 = sse2.unpackhi_i64x2(i64x2_from_i32x4(u6), i64x2_from_i32x4(u7));
+
+        // Rotate the rows to get the correct final order (v8, v12 need no rotation).
+        let v9 = ssse3.alignr_u8x16::<2>(u8x16_from_i64x2(v9), u8x16_from_i64x2(v9));
+        let v10 = ssse3.alignr_u8x16::<4>(u8x16_from_i64x2(v10), u8x16_from_i64x2(v10));
+        let v11 = ssse3.alignr_u8x16::<6>(u8x16_from_i64x2(v11), u8x16_from_i64x2(v11));
+        let v13 = ssse3.alignr_u8x16::<10>(u8x16_from_i64x2(v13), u8x16_from_i64x2(v13));
+        let v14 = ssse3.alignr_u8x16::<12>(u8x16_from_i64x2(v14), u8x16_from_i64x2(v14));
+        let v15 = ssse3.alignr_u8x16::<14>(u8x16_from_i64x2(v15), u8x16_from_i64x2(v15));
+
+        // Widen each permuted row of 8 halves to 8 f32 with a single `vcvtph2ps`,
+        // exactly as the OpenEXR original does.
+        let store8 = |reg: [u16; 8], out: &mut [f32]| {
+            out.copy_from_slice(&f16c.f16_to_f32x8(reg));
+        };
+        store8(u16x8_from_u8x16(u8x16_from_i64x2(v8)), &mut dst[0..8]);
+        store8(u16x8_from_u8x16(v9), &mut dst[8..16]);
+        store8(u16x8_from_u8x16(v10), &mut dst[16..24]);
+        store8(u16x8_from_u8x16(v11), &mut dst[24..32]);
+        store8(u16x8_from_u8x16(u8x16_from_i64x2(v12)), &mut dst[32..40]);
+        store8(u16x8_from_u8x16(v13), &mut dst[40..48]);
+        store8(u16x8_from_u8x16(v14), &mut dst[48..56]);
+        store8(u16x8_from_u8x16(v15), &mut dst[56..64]);
+    }
 }
 
 // Requires a host with AVX2 + F16C, hence gated behind the same opt-in feature
@@ -414,17 +489,23 @@ pub(super) fn from_half_zigzag(v3: V3, f16c: F16c, src: &[u16; 64], dst: &mut [f
 #[cfg(all(test, feature = "avx2-tests"))]
 mod test {
     use half::f16;
-    use pulp::core_arch::x86::F16c;
-    use pulp::x86::V3;
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::f16c::F16c;
+    use miraculix::x86::ops::sse::sse2::Sse2;
+    use miraculix::x86::ops::sse::sse41::Sse41;
+    use miraculix::x86::ops::sse::ssse3::Ssse3;
 
     use super::super::super::quantization::ZIGZAG_ORDER;
     use super::super::super::transfer_curve::to_linear_table;
     use super::{from_half_zigzag, write_row_f16, write_row_f32};
 
-    fn expect_avx2() -> (V3, F16c) {
+    fn expect_avx2() -> (Sse2, Ssse3, Sse41, F16c) {
+        let features = detect_features();
         (
-            V3::try_new().expect("AVX2 SIMD mode requested, but the AVX2/FMA tier is unavailable"),
-            F16c::try_new().expect("F16C requested, but unavailable"),
+            Sse2::from_features(features).expect("SSE2 SIMD mode requested, but unavailable"),
+            Ssse3::from_features(features).expect("SSSE3 SIMD mode requested, but unavailable"),
+            Sse41::from_features(features).expect("SSE4.1 SIMD mode requested, but unavailable"),
+            F16c::from_features(features).expect("F16C requested, but unavailable"),
         )
     }
 
@@ -434,7 +515,7 @@ mod test {
     /// half bit patterns is covered, in every one of the 64 lanes.
     #[test]
     fn zigzag_simd_matches_scalar() {
-        let (v3, f16c) = expect_avx2();
+        let (sse2, ssse3, sse41, f16c) = expect_avx2();
         let mut simd = [0.0f32; 64];
         let mut scalar = [0.0f32; 64];
 
@@ -446,7 +527,7 @@ mod test {
                 *slot = base.wrapping_add(lane as u16 * 1013);
             }
 
-            from_half_zigzag(v3, f16c, &zig_zag, &mut simd);
+            from_half_zigzag(sse2, ssse3, sse41, f16c, &zig_zag, &mut simd);
             for (slot, &src_index) in scalar.iter_mut().zip(ZIGZAG_ORDER.iter()) {
                 *slot = f16::from_bits(zig_zag[src_index]).to_f32();
             }
@@ -531,11 +612,11 @@ mod test {
 
     #[test]
     fn write_row_f16_matches_scalar() {
-        let (v3, f16c) = expect_avx2();
+        let (_, _, _, f16c) = expect_avx2();
         for to_linear in [None, Some(to_linear_table())] {
             for row in sweep_rows() {
                 let mut simd = [0u8; 16];
-                assert!(write_row_f16(v3, f16c, &row, to_linear, &mut simd));
+                assert!(write_row_f16(f16c, &row, to_linear, &mut simd));
 
                 for (lane, &value) in row.iter().enumerate() {
                     let expected = scalar_linear_bits(value, to_linear);
@@ -552,11 +633,11 @@ mod test {
 
     #[test]
     fn write_row_f32_matches_scalar() {
-        let (v3, f16c) = expect_avx2();
+        let (_, _, _, f16c) = expect_avx2();
         for to_linear in [None, Some(to_linear_table())] {
             for row in sweep_rows() {
                 let mut simd = [0u8; 32];
-                assert!(write_row_f32(v3, f16c, &row, to_linear, &mut simd));
+                assert!(write_row_f32(f16c, &row, to_linear, &mut simd));
 
                 for (lane, &value) in row.iter().enumerate() {
                     let expected = f16::from_bits(scalar_linear_bits(value, to_linear)).to_f32();
@@ -587,11 +668,11 @@ mod test {
 
     #[test]
     fn write_row_falls_back_for_short_rows() {
-        let (v3, f16c) = expect_avx2();
+        let (_, _, _, f16c) = expect_avx2();
         let row = [0.0f32; 7];
         let mut out16 = [0u8; 14];
         let mut out32 = [0u8; 28];
-        assert!(!write_row_f16(v3, f16c, &row, None, &mut out16));
-        assert!(!write_row_f32(v3, f16c, &row, None, &mut out32));
+        assert!(!write_row_f16(f16c, &row, None, &mut out16));
+        assert!(!write_row_f32(f16c, &row, None, &mut out32));
     }
 }

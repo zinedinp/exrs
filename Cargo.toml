@@ -33,9 +33,7 @@ flate2 = { version = "^1.1.9", default-features = false, features = ["zlib-rs"] 
 smallvec = "^1.15.2"            # make cache-friendly allocations        TODO profile if smallvec is really an improvement!
 rayon-core = { version = "^1.13.0", optional = true }         # threading for parallel compression
 zune-inflate = { version = "^0.2.54", default-features = false, features = ["zlib"] }  # zip decompression, faster than miniz_oxide
-pulp = { version = "0.22.3", features = ["x86-v4"] }   # runtime SIMD dispatch for the codecs not yet ported to miraculix (CSC, DCT, lossy_dct); removed once those land too
-num-complex = "0.4.6"          # pins pulps own dependency, pulp wants 0.4.4 but calls for Complex::ZERO/ONE/I; consts added in 0.4.6
-miraculix = { path = "../miraculix" }   # x86 SIMD wrapper crate
+miraculix = { path = "../miraculix" }   # x86 SIMD wrapper crate for all x86 SIMD (pulp fully removed 2026-08-12)
 [dev-dependencies]
 bencher = "0.1.5"
 walkdir = "2.3.2"         # automatically test things for all files in a directory
@@ -185,9 +183,6 @@ inherits = "release"
 lto = false
 debug = 2
 codegen-units = 16
-
-[patch.crates-io]
-pulp = { git = "https://github.com/zinezockt/pulp.git", branch = "main" }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = { version = "11.6.0", default-features = false }

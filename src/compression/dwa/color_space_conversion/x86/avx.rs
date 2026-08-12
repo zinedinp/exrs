@@ -4,7 +4,7 @@
 // Needs only the base `Avx` token (f32 arithmetic), unlike `optimize_bytes`,
 // CSC never touches AVX2 integer ops, but the file keeps the `avx2.rs` name
 // since this is the kernel the AVX2/F16C fused decode path (`lossy_dct`)
-// reaches for. (WIT)
+// reaches for.
 
 use miraculix::x86::ops::avx::avx::Avx;
 
@@ -23,29 +23,37 @@ pub fn csc709_forward_8x8(avx: Avx, block: &mut [[f32; 64]; 3]) {
     csc709_forward_8x8_batch(avx, std::iter::once(block));
 }
 
-pub fn csc709_forward_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
-    // OpenEXR's modified 709 coefficients (zero-centered chroma).
-    let c_r = [0.2126f32; 8];
-    let c_g = [0.7152f32; 8];
-    let c_b = [0.0722f32; 8];
-    let inv_by = [1.0f32 / 1.8556; 8];
-    let inv_ry = [1.0f32 / 1.5747; 8];
+// Wrapped in `miraculix::avx_fn!`: the composed `add_f32x8`/`mul_f32x8`/
+// `sub_f32x8` chain per chunk needs a shared `#[target_feature]` context to
+// inline into real `ymm` code instead of a `callq` chain
+miraculix::avx_fn! {
+    pub fn csc709_forward_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+        // OpenEXR's modified 709 coefficients (zero-centered chroma).
+        let c_r = [0.2126f32; 8];
+        let c_g = [0.7152f32; 8];
+        let c_b = [0.0722f32; 8];
+        let inv_by = [1.0f32 / 1.8556; 8];
+        let inv_ry = [1.0f32 / 1.5747; 8];
 
-    for block in blocks {
-        let [r, g, b] = block;
-        for chunk in 0..8 {
-            let base = chunk * 8;
-            let rv = load(r, base);
-            let gv = load(g, base);
-            let bv = load(b, base);
+        for block in blocks {
+            let [r, g, b] = block;
+            for chunk in 0..8 {
+                let base = chunk * 8;
+                let rv = load(r, base);
+                let gv = load(g, base);
+                let bv = load(b, base);
 
-            let y = avx.add_f32x8(avx.add_f32x8(avx.mul_f32x8(rv, c_r), avx.mul_f32x8(gv, c_g)), avx.mul_f32x8(bv, c_b));
-            let by = avx.mul_f32x8(avx.sub_f32x8(bv, y), inv_by);
-            let ry = avx.mul_f32x8(avx.sub_f32x8(rv, y), inv_ry);
+                let y = avx.add_f32x8(
+                    avx.add_f32x8(avx.mul_f32x8(rv, c_r), avx.mul_f32x8(gv, c_g)),
+                    avx.mul_f32x8(bv, c_b),
+                );
+                let by = avx.mul_f32x8(avx.sub_f32x8(bv, y), inv_by);
+                let ry = avx.mul_f32x8(avx.sub_f32x8(rv, y), inv_ry);
 
-            store(r, base, y);
-            store(g, base, by);
-            store(b, base, ry);
+                store(r, base, y);
+                store(g, base, by);
+                store(b, base, ry);
+            }
         }
     }
 }
@@ -81,8 +89,11 @@ pub(crate) fn inverse_one(avx: Avx, block: &mut [[f32; 64]; 3]) {
     }
 }
 
-pub fn csc709_inverse_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
-    for block in blocks {
-        inverse_one(avx, block);
+// Wrapped in `miraculix::avx_fn!`
+miraculix::avx_fn! {
+    pub fn csc709_inverse_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+        for block in blocks {
+            inverse_one(avx, block);
+        }
     }
 }

@@ -17,8 +17,8 @@ use miraculix::x86::ops::avx::avx2::Avx2;
 use miraculix::x86::ops::sse::sse2::Sse2;
 use miraculix::x86::ops::sse::ssse3::Ssse3;
 
-use super::sse;
-use super::sse::{to_i8x16, to_u8x16};
+use super::ssse3;
+use super::ssse3::{to_i8x16, to_u8x16};
 
 /// Production AVX2 entry: lane-prefix with hierarchical SSE remainder.
 #[inline]
@@ -63,7 +63,7 @@ fn run_lane(avx2: Avx2, sse2: Sse2, ssse3: Ssse3, buffer: &mut [u8], tail: Tail)
     }
 
     if buffer.len() < 32 {
-        sse::differences_to_samples(sse2, ssse3, buffer);
+        ssse3::differences_to_samples(sse2, ssse3, buffer);
         return;
     }
 
@@ -207,7 +207,7 @@ fn finish_tail_scalar(sse2: Sse2, ssse3: Ssse3, done: usize, carry: u8, buffer: 
     if done == 0 {
         // No full 32-byte chunk: undo pre-bias and use the SSE path.
         buffer[0] = buffer[0].wrapping_sub(128);
-        sse::differences_to_samples(sse2, ssse3, buffer);
+        ssse3::differences_to_samples(sse2, ssse3, buffer);
         return;
     }
     residual_from_carry(carry, done, buffer);
@@ -222,10 +222,10 @@ fn finish_tail_sse(sse2: Sse2, ssse3: Ssse3, done: usize, carry: u8, buffer: &mu
     }
     if done == 0 {
         buffer[0] = buffer[0].wrapping_sub(128);
-        sse::differences_to_samples(sse2, ssse3, buffer);
+        ssse3::differences_to_samples(sse2, ssse3, buffer);
         return;
     }
-    sse::differences_to_samples_from(sse2, ssse3, buffer, done, carry);
+    ssse3::differences_to_samples_from(sse2, ssse3, buffer, done, carry);
 }
 
 /// Scalar tail: `sample[i] = prev + diff[i] - 128` from `start` onward.

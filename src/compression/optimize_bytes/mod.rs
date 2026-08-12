@@ -243,7 +243,7 @@ mod test {
 
             if let (Some(sse2), Some(ssse3)) = sse_tokens {
                 let mut simd = source.clone();
-                x86::sse::differences_to_samples(sse2, ssse3, &mut simd);
+                x86::ssse3::differences_to_samples(sse2, ssse3, &mut simd);
                 assert_eq!(scalar, simd, "sse reconstruct len={len}");
             }
             if let (Some(avx2), Some(sse2), Some(ssse3)) = (avx2_token, sse_tokens.0, sse_tokens.1) {
@@ -263,11 +263,11 @@ mod test {
                 (avx512_tokens.0, avx512_tokens.1, avx2_token, sse_tokens.0, sse_tokens.1)
             {
                 let mut lane = source.clone();
-                x86::avx512::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut lane);
+                x86::avx512bw::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut lane);
                 assert_eq!(scalar, lane, "avx512_lane reconstruct len={len}");
 
                 let mut masked = source.clone();
-                x86::avx512::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut masked);
+                x86::avx512bw::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut masked);
                 assert_eq!(scalar, masked, "avx512_lane_masked reconstruct len={len}");
             }
         }
@@ -287,7 +287,7 @@ mod test {
 
         if let (Some(sse2), Some(ssse3)) = (miraculix_x86::sse2(), miraculix_x86::ssse3()) {
             let mut a = source.clone();
-            x86::sse::differences_to_samples(sse2, ssse3, &mut a);
+            x86::ssse3::differences_to_samples(sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "sse large");
         }
         if let (Some(avx2), Some(sse2), Some(ssse3)) =
@@ -311,10 +311,10 @@ mod test {
             miraculix_x86::ssse3(),
         ) {
             let mut a = source.clone();
-            x86::avx512::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut a);
+            x86::avx512bw::differences_to_samples_lane(f, bw, avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx512_lane large");
             let mut a = source.clone();
-            x86::avx512::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut a);
+            x86::avx512bw::differences_to_samples_lane_masked(f, bw, avx2, sse2, ssse3, &mut a);
             assert_eq!(scalar, a, "avx512_lane_masked large");
         }
     }
