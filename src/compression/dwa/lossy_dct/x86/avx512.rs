@@ -11,6 +11,8 @@
 // falls back to the single-block AVX2 kernel instead. An odd trailing block
 // also falls back to the AVX2 tier's single-block fused body.
 
+use miraculix::x86::ops::avx::avx::Avx;
+use miraculix::x86::ops::avx512::avx512f::Avx512f;
 use pulp::core_arch::x86::F16c;
 use pulp::x86::{V3, V4};
 
@@ -96,6 +98,7 @@ pulp::v4_fn! {
     fn decode_pair_dct_csc(
         v4: V4,
         v3: V3,
+        avx512f: Avx512f,
         components: usize,
         needs_a: [bool; 3],
         needs_b: [bool; 3],
@@ -172,7 +175,7 @@ pulp::v4_fn! {
         }
 
         if components == 3 {
-            color_space_conversion::x86::avx512::inverse_pair(v4, dct_a, dct_b);
+            color_space_conversion::x86::avx512::inverse_pair(avx512f, dct_a, dct_b);
         }
     }
 }
@@ -188,6 +191,8 @@ fn step_pair_or_single(
     v4: V4,
     v3: V3,
     f16c: F16c,
+    avx: Avx,
+    avx512f: Avx512f,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     block_index: usize,
@@ -237,7 +242,7 @@ fn step_pair_or_single(
             return (next_index, Some(e));
         }
 
-        decode_pair_dct_csc(v4, v3, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
+        decode_pair_dct_csc(v4, v3, avx512f, components, needs_a, needs_b, &mut dct_a, &mut dct_b);
 
         // Pair-write is only valid when B sits immediately right of A in the
         // same block row (so their output spans are contiguous) and B is
@@ -271,7 +276,7 @@ fn step_pair_or_single(
             }
 
             if components == 3 {
-                color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_a);
+                color_space_conversion::x86::avx2::inverse_one(avx, &mut dct_a);
             }
 
             write_err = write_block(
@@ -294,10 +299,11 @@ fn step_pair_or_single(
 /// DCT/CSC step processes 2 spatial blocks at once (one 512-bit register per
 /// step). Zigzag and write stay on the single-block AVX2+F16C kernels, except
 /// write widens to 16 lanes for horizontally-adjacent pairs (`write_pair_block`).
-/// Caller (`x86::mod`) has already confirmed `v4`/`f16c` are available.
 pub(super) fn decode_group_fused(
     v4: V4,
     f16c: F16c,
+    avx: Avx,
+    avx512f: Avx512f,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     width: usize,
@@ -320,8 +326,8 @@ pub(super) fn decode_group_fused(
     let mut block_index = 0usize;
     while block_index < block_count {
         let (next, err) = step_pair_or_single(
-            v4, v3, f16c, ac, dc, block_index, block_count, blocks_x, width, height, components,
-            to_linear, targets, out,
+            v4, v3, f16c, avx, avx512f, ac, dc, block_index, block_count, blocks_x, width, height,
+            components, to_linear, targets, out,
         );
         if let Some(e) = err {
             return Err(e);

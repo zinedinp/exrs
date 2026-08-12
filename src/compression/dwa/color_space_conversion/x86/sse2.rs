@@ -1,36 +1,34 @@
-// SSE2 V1 tier: same per-element linear combination as the avx2 tier, just
+// SSE tier: same per-element linear combination as the avx tier, just
 // 4-wide instead of 8-wide (16 chunks of the 64-element block instead of 8).
+// Needs only the base `Sse` token (f32 arithmetic), unlike `optimize_bytes`,
+// CSC never touches integer/double SSE2 ops, but the file keeps the `sse2.rs`
+// name to match the "one file per SIMD tier" convention shared with the
+// still-pulp `discrete_cosine_transform`/`lossy_dct` submodules. (WIT)
 
-use pulp::{f32x4, x86::V1};
+use miraculix::x86::ops::sse::sse::Sse;
 
 #[inline(always)]
-fn load(array: &[f32; 64], base: usize) -> f32x4 {
-    f32x4(array[base], array[base + 1], array[base + 2], array[base + 3])
+fn load(array: &[f32; 64], base: usize) -> [f32; 4] {
+    [array[base], array[base + 1], array[base + 2], array[base + 3]]
 }
 
 #[inline(always)]
-fn store(array: &mut [f32; 64], base: usize, value: f32x4) {
-    array[base] = value.0;
-    array[base + 1] = value.1;
-    array[base + 2] = value.2;
-    array[base + 3] = value.3;
+fn store(array: &mut [f32; 64], base: usize, value: [f32; 4]) {
+    array[base..base + 4].copy_from_slice(&value);
 }
 
 #[cfg(any(feature = "sse2-tests", feature = "simd-benches"))]
-pub fn csc709_forward_8x8(v1: V1, block: &mut [[f32; 64]; 3]) {
-    csc709_forward_8x8_batch(v1, std::iter::once(block));
+pub fn csc709_forward_8x8(sse: Sse, block: &mut [[f32; 64]; 3]) {
+    csc709_forward_8x8_batch(sse, std::iter::once(block));
 }
 
-pub fn csc709_forward_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
-    let c_r = v1.splat_f32x4(0.2126);
-    let c_g = v1.splat_f32x4(0.7152);
-    let c_b = v1.splat_f32x4(0.0722);
-    let inv_by = v1.splat_f32x4(1.0 / 1.8556);
-    let inv_ry = v1.splat_f32x4(1.0 / 1.5747);
-
-    let mul = |a, b| v1.mul_f32x4(a, b);
-    let add = |a, b| v1.add_f32x4(a, b);
-    let sub = |a, b| v1.sub_f32x4(a, b);
+pub fn csc709_forward_8x8_batch<'a>(sse: Sse, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+    // OpenEXR's modified 709 coefficients (zero-centered chroma).
+    let c_r = [0.2126f32; 4];
+    let c_g = [0.7152f32; 4];
+    let c_b = [0.0722f32; 4];
+    let inv_by = [1.0f32 / 1.8556; 4];
+    let inv_ry = [1.0f32 / 1.5747; 4];
 
     for block in blocks {
         let [r, g, b] = block;
@@ -40,9 +38,9 @@ pub fn csc709_forward_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut
             let gv = load(g, base);
             let bv = load(b, base);
 
-            let y = add(add(mul(rv, c_r), mul(gv, c_g)), mul(bv, c_b));
-            let by = mul(sub(bv, y), inv_by);
-            let ry = mul(sub(rv, y), inv_ry);
+            let y = sse.add_f32x4(sse.add_f32x4(sse.mul_f32x4(rv, c_r), sse.mul_f32x4(gv, c_g)), sse.mul_f32x4(bv, c_b));
+            let by = sse.mul_f32x4(sse.sub_f32x4(bv, y), inv_by);
+            let ry = sse.mul_f32x4(sse.sub_f32x4(rv, y), inv_ry);
 
             store(r, base, y);
             store(g, base, by);
@@ -52,29 +50,25 @@ pub fn csc709_forward_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut
 }
 
 #[cfg(any(feature = "sse2-tests", feature = "simd-benches"))]
-pub fn csc709_inverse_8x8(v1: V1, block: &mut [[f32; 64]; 3]) {
-    csc709_inverse_8x8_batch(v1, std::iter::once(block));
+pub fn csc709_inverse_8x8(sse: Sse, block: &mut [[f32; 64]; 3]) {
+    csc709_inverse_8x8_batch(sse, std::iter::once(block));
 }
 
-pub fn csc709_inverse_8x8_batch<'a>(v1: V1, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+pub fn csc709_inverse_8x8_batch<'a>(sse: Sse, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
     for block in blocks {
-        inverse_one(v1, block);
+        inverse_one(sse, block);
     }
 }
 
 /// One 8x8 inverse CSC. Extracted from `csc709_inverse_8x8_batch` (mirrors
-/// `avx2::inverse_one`) so the SSE2 fused decode path can call it per spatial
+/// `avx2::inverse_one`) so the SSE fused decode path can call it per spatial
 /// block while the three component buffers are still L1-hot.
 #[inline(always)]
-pub(crate) fn inverse_one(v1: V1, block: &mut [[f32; 64]; 3]) {
-    let c_ry = v1.splat_f32x4(1.5747);
-    let c_by_g = v1.splat_f32x4(0.1873);
-    let c_ry_g = v1.splat_f32x4(0.4682);
-    let c_by = v1.splat_f32x4(1.8556);
-
-    let mul = |a, b| v1.mul_f32x4(a, b);
-    let add = |a, b| v1.add_f32x4(a, b);
-    let sub = |a, b| v1.sub_f32x4(a, b);
+pub(crate) fn inverse_one(sse: Sse, block: &mut [[f32; 64]; 3]) {
+    let c_ry = [1.5747f32; 4];
+    let c_by_g = [0.1873f32; 4];
+    let c_ry_g = [0.4682f32; 4];
+    let c_by = [1.8556f32; 4];
 
     let [comp0, comp1, comp2] = block;
     for chunk in 0..16 {
@@ -83,9 +77,9 @@ pub(crate) fn inverse_one(v1: V1, block: &mut [[f32; 64]; 3]) {
         let by = load(comp1, base);
         let ry = load(comp2, base);
 
-        let r = add(y, mul(ry, c_ry));
-        let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
-        let b = add(y, mul(by, c_by));
+        let r = sse.add_f32x4(y, sse.mul_f32x4(ry, c_ry));
+        let g = sse.sub_f32x4(sse.sub_f32x4(y, sse.mul_f32x4(by, c_by_g)), sse.mul_f32x4(ry, c_ry_g));
+        let b = sse.add_f32x4(y, sse.mul_f32x4(by, c_by));
 
         store(comp0, base, r);
         store(comp1, base, g);

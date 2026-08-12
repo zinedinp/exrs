@@ -51,7 +51,8 @@ fn csc709_inverse_8x8(data: &mut [[f32; 64]; 3]) {
 // AVX2 tier correctness tests.
 #[cfg(all(test, feature = "avx2-tests"))]
 mod avx2_tests {
-    use pulp::x86::V3;
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
 
     use super::{
         super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::avx2},
@@ -61,19 +62,19 @@ mod avx2_tests {
     #[test]
     fn avx2_forward_matches_autovectorized() {
         assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            avx2::csc709_forward_8x8(expect_avx2(), data)
+            avx2::csc709_forward_8x8(expect_avx(), data)
         });
     }
 
     #[test]
     fn avx2_inverse_matches_autovectorized() {
         assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            avx2::csc709_inverse_8x8(expect_avx2(), data)
+            avx2::csc709_inverse_8x8(expect_avx(), data)
         });
     }
 
-    fn expect_avx2() -> V3 {
-        V3::try_new().expect("AVX2 SIMD mode requested, but the AVX2/FMA tier is unavailable")
+    fn expect_avx() -> Avx {
+        Avx::from_features(detect_features()).expect("AVX SIMD mode requested, but AVX is unavailable")
     }
 }
 
@@ -81,7 +82,8 @@ mod avx2_tests {
 // runtime dispatch).
 #[cfg(all(test, feature = "avx512-tests"))]
 mod avx512_tests {
-    use pulp::x86::V4;
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
     use super::{
         super::{csc709_inverse_8x8_autovectorized, x86::avx512},
@@ -116,15 +118,18 @@ mod avx512_tests {
         assert_pairs_match(|a, b| avx512::csc709_inverse_8x8_pair(expect_avx512(), a, b));
     }
 
-    fn expect_avx512() -> V4 {
-        V4::try_new().expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
+    fn expect_avx512() -> Avx512f {
+        Avx512f::from_features(detect_features())
+            .expect("AVX-512 SIMD mode requested, but the AVX-512 tier is unavailable")
     }
 }
 
 // SSE2 tier correctness tests.
 #[cfg(all(test, feature = "sse2-tests"))]
 mod sse2_tests {
-    use pulp::x86::{V1, V3};
+    use miraculix::x86::detect_features;
+    use miraculix::x86::ops::avx::avx::Avx;
+    use miraculix::x86::ops::sse::sse::Sse;
 
     use super::{
         super::{csc709_forward_8x8_autovectorized, csc709_inverse_8x8_autovectorized, x86::sse2},
@@ -134,24 +139,27 @@ mod sse2_tests {
     #[test]
     fn assert_sse2_forward_close_to_autovectorized_reference() {
         assert_blocks_match(csc709_forward_8x8_autovectorized, |data| {
-            sse2::csc709_forward_8x8(expect_sse2_without_avx2(), data)
+            sse2::csc709_forward_8x8(expect_sse_without_avx(), data)
         });
     }
 
     #[test]
     fn assert_sse2_inverse_close_to_autovectorized_reference() {
         assert_blocks_match(csc709_inverse_8x8_autovectorized, |data| {
-            sse2::csc709_inverse_8x8(expect_sse2_without_avx2(), data)
+            sse2::csc709_inverse_8x8(expect_sse_without_avx(), data)
         });
     }
 
-    fn expect_sse2() -> V1 {
-        V1::try_new().expect("SSE2 SIMD mode requested, but the SSE2 tier is unavailable")
+    fn expect_sse() -> Sse {
+        Sse::from_features(detect_features()).expect("SSE SIMD mode requested, but SSE is unavailable")
     }
 
-    fn expect_sse2_without_avx2() -> V1 {
-        assert!(V3::try_new().is_none(), "SSE2 dispatch fallback test must run with AVX2 hidden");
-        expect_sse2()
+    fn expect_sse_without_avx() -> Sse {
+        assert!(
+            Avx::from_features(detect_features()).is_none(),
+            "SSE dispatch fallback test must run with AVX hidden"
+        );
+        expect_sse()
     }
 }
 

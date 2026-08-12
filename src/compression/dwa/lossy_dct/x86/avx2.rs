@@ -6,6 +6,7 @@
 use std::convert::TryInto;
 
 use half::f16;
+use miraculix::x86::ops::avx::avx::Avx;
 use pulp::core_arch::x86::F16c;
 use pulp::x86::V3;
 
@@ -119,10 +120,11 @@ pub(super) fn write_block(
 
 /// For each spatial 8x8, finish unRLE -> zigzag -> iDCT -> CSC -> scanline
 /// write before touching the next block. Caller (`x86::mod`) has already
-/// confirmed `v3`/`f16c` are available.
+/// confirmed `v3`/`f16c`/`avx` are available.
 pub(super) fn decode_group_fused(
     v3: V3,
     f16c: F16c,
+    avx: Avx,
     ac: &mut PackedStream<'_>,
     dc: &mut PackedStream<'_>,
     width: usize,
@@ -176,7 +178,7 @@ pub(super) fn decode_group_fused(
                 }
 
                 if components == 3 {
-                    color_space_conversion::x86::avx2::inverse_one(v3, &mut dct_blocks);
+                    color_space_conversion::x86::avx2::inverse_one(avx, &mut dct_blocks);
                 }
 
                 write_err = write_block(

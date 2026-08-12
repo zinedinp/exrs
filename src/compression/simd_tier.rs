@@ -113,13 +113,26 @@ pub(crate) mod x86 {
 
     pub(crate) mod miraculix_x86 {
         use miraculix::x86::detect_features;
+        use miraculix::x86::ops::avx::avx::Avx;
         use miraculix::x86::ops::avx::avx2::Avx2;
         use miraculix::x86::ops::avx512::avx512bw::Avx512Bw;
         use miraculix::x86::ops::avx512::avx512f::Avx512f;
+        use miraculix::x86::ops::sse::sse::Sse;
         use miraculix::x86::ops::sse::sse2::Sse2;
         use miraculix::x86::ops::sse::ssse3::Ssse3;
 
         use super::super::{Tier, cap};
+
+        /// Base SSE token (f32 ops only), unless the process is capped below
+        /// the SSE tier. (WIT))
+        #[inline(always)]
+        pub(crate) fn sse() -> Option<Sse> {
+            if cap() >= Tier::Sse {
+                Sse::from_features(detect_features())
+            } else {
+                None
+            }
+        }
 
         /// SSE2 baseline token, unless the process is capped below the SSE
         /// tier. Pairs with [`ssse3`] for the SSE-tier kernels.
@@ -147,6 +160,17 @@ pub(crate) mod x86 {
         pub(crate) fn avx2() -> Option<Avx2> {
             if cap() >= Tier::Avx2 {
                 Avx2::from_features(detect_features())
+            } else {
+                None
+            }
+        }
+
+        /// Base AVX token (f32 ops only), capped at the AVX2 tier rather
+        /// than its own (WIT)
+        #[inline(always)]
+        pub(crate) fn avx() -> Option<Avx> {
+            if cap() >= Tier::Avx2 {
+                Avx::from_features(detect_features())
             } else {
                 None
             }

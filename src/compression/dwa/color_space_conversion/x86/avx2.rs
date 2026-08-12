@@ -1,102 +1,79 @@
-// AVX2 V3 tier: the CSC transform is a fixed per-element linear combination
+// AVX tier: the CSC transform is a fixed per-element linear combination
 // of three same-length arrays (no cross-lane shuffles needed), so each 8-wide
 // chunk of the 64-element block is loaded, combined, and stored independently.
-use pulp::{f32x8, x86::V3};
+// Needs only the base `Avx` token (f32 arithmetic), unlike `optimize_bytes`,
+// CSC never touches AVX2 integer ops, but the file keeps the `avx2.rs` name
+// since this is the kernel the AVX2/F16C fused decode path (`lossy_dct`)
+// reaches for. (WIT)
+
+use miraculix::x86::ops::avx::avx::Avx;
 
 #[inline(always)]
-fn load(v3: V3, array: &[f32; 64], base: usize) -> f32x8 {
-    let _ = v3;
-    f32x8(
-        array[base],
-        array[base + 1],
-        array[base + 2],
-        array[base + 3],
-        array[base + 4],
-        array[base + 5],
-        array[base + 6],
-        array[base + 7],
-    )
+fn load(array: &[f32; 64], base: usize) -> [f32; 8] {
+    array[base..base + 8].try_into().unwrap()
 }
 
 #[inline(always)]
-fn store(array: &mut [f32; 64], base: usize, value: f32x8) {
-    array[base] = value.0;
-    array[base + 1] = value.1;
-    array[base + 2] = value.2;
-    array[base + 3] = value.3;
-    array[base + 4] = value.4;
-    array[base + 5] = value.5;
-    array[base + 6] = value.6;
-    array[base + 7] = value.7;
+fn store(array: &mut [f32; 64], base: usize, value: [f32; 8]) {
+    array[base..base + 8].copy_from_slice(&value);
 }
 
 #[cfg(any(feature = "avx2-tests", feature = "simd-benches"))]
-pub fn csc709_forward_8x8(v3: V3, block: &mut [[f32; 64]; 3]) {
-    csc709_forward_8x8_batch(v3, std::iter::once(block));
+pub fn csc709_forward_8x8(avx: Avx, block: &mut [[f32; 64]; 3]) {
+    csc709_forward_8x8_batch(avx, std::iter::once(block));
 }
 
-pub fn csc709_forward_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
-    v3.vectorize(move || {
-        // OpenEXR's modified 709 coefficients (zero-centered chroma).
-        let c_r = v3.splat_f32x8(0.2126);
-        let c_g = v3.splat_f32x8(0.7152);
-        let c_b = v3.splat_f32x8(0.0722);
-        let inv_by = v3.splat_f32x8(1.0 / 1.8556);
-        let inv_ry = v3.splat_f32x8(1.0 / 1.5747);
+pub fn csc709_forward_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+    // OpenEXR's modified 709 coefficients (zero-centered chroma).
+    let c_r = [0.2126f32; 8];
+    let c_g = [0.7152f32; 8];
+    let c_b = [0.0722f32; 8];
+    let inv_by = [1.0f32 / 1.8556; 8];
+    let inv_ry = [1.0f32 / 1.5747; 8];
 
-        let mul = |a, b| v3.mul_f32x8(a, b);
-        let add = |a, b| v3.add_f32x8(a, b);
-        let sub = |a, b| v3.sub_f32x8(a, b);
+    for block in blocks {
+        let [r, g, b] = block;
+        for chunk in 0..8 {
+            let base = chunk * 8;
+            let rv = load(r, base);
+            let gv = load(g, base);
+            let bv = load(b, base);
 
-        for block in blocks {
-            let [r, g, b] = block;
-            for chunk in 0..8 {
-                let base = chunk * 8;
-                let rv = load(v3, r, base);
-                let gv = load(v3, g, base);
-                let bv = load(v3, b, base);
+            let y = avx.add_f32x8(avx.add_f32x8(avx.mul_f32x8(rv, c_r), avx.mul_f32x8(gv, c_g)), avx.mul_f32x8(bv, c_b));
+            let by = avx.mul_f32x8(avx.sub_f32x8(bv, y), inv_by);
+            let ry = avx.mul_f32x8(avx.sub_f32x8(rv, y), inv_ry);
 
-                let y = add(add(mul(rv, c_r), mul(gv, c_g)), mul(bv, c_b));
-                let by = mul(sub(bv, y), inv_by);
-                let ry = mul(sub(rv, y), inv_ry);
-
-                store(r, base, y);
-                store(g, base, by);
-                store(b, base, ry);
-            }
+            store(r, base, y);
+            store(g, base, by);
+            store(b, base, ry);
         }
-    });
+    }
 }
 
 #[cfg(any(feature = "avx2-tests", feature = "simd-benches"))]
-pub fn csc709_inverse_8x8(v3: V3, block: &mut [[f32; 64]; 3]) {
-    csc709_inverse_8x8_batch(v3, std::iter::once(block));
+pub fn csc709_inverse_8x8(avx: Avx, block: &mut [[f32; 64]; 3]) {
+    csc709_inverse_8x8_batch(avx, std::iter::once(block));
 }
 
-/// One 8x8 inverse CSC. Must run inside a `V3::vectorize` trampoline so the
-/// ops lower to AVX2; the fused lossy-DCT decode path calls this per spatial
-/// block while the three component buffers are still L1-hot.
+/// One 8x8 inverse CSC. The fused lossy-DCT decode path calls this per
+/// spatial block while the three component buffers are still L1-hot.
 #[inline(always)]
-pub(crate) fn inverse_one(v3: V3, block: &mut [[f32; 64]; 3]) {
-    let c_ry = v3.splat_f32x8(1.5747);
-    let c_by_g = v3.splat_f32x8(0.1873);
-    let c_ry_g = v3.splat_f32x8(0.4682);
-    let c_by = v3.splat_f32x8(1.8556);
-
-    let mul = |a, b| v3.mul_f32x8(a, b);
-    let add = |a, b| v3.add_f32x8(a, b);
-    let sub = |a, b| v3.sub_f32x8(a, b);
+pub(crate) fn inverse_one(avx: Avx, block: &mut [[f32; 64]; 3]) {
+    let c_ry = [1.5747f32; 8];
+    let c_by_g = [0.1873f32; 8];
+    let c_ry_g = [0.4682f32; 8];
+    let c_by = [1.8556f32; 8];
 
     let [comp0, comp1, comp2] = block;
     for chunk in 0..8 {
         let base = chunk * 8;
-        let y = load(v3, comp0, base);
-        let by = load(v3, comp1, base);
-        let ry = load(v3, comp2, base);
+        let y = load(comp0, base);
+        let by = load(comp1, base);
+        let ry = load(comp2, base);
 
-        let r = add(y, mul(ry, c_ry));
-        let g = sub(sub(y, mul(by, c_by_g)), mul(ry, c_ry_g));
-        let b = add(y, mul(by, c_by));
+        let r = avx.add_f32x8(y, avx.mul_f32x8(ry, c_ry));
+        let g = avx.sub_f32x8(avx.sub_f32x8(y, avx.mul_f32x8(by, c_by_g)), avx.mul_f32x8(ry, c_ry_g));
+        let b = avx.add_f32x8(y, avx.mul_f32x8(by, c_by));
 
         store(comp0, base, r);
         store(comp1, base, g);
@@ -104,10 +81,8 @@ pub(crate) fn inverse_one(v3: V3, block: &mut [[f32; 64]; 3]) {
     }
 }
 
-pub fn csc709_inverse_8x8_batch<'a>(v3: V3, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
-    v3.vectorize(move || {
-        for block in blocks {
-            inverse_one(v3, block);
-        }
-    });
+pub fn csc709_inverse_8x8_batch<'a>(avx: Avx, blocks: impl Iterator<Item = &'a mut [[f32; 64]; 3]>) {
+    for block in blocks {
+        inverse_one(avx, block);
+    }
 }

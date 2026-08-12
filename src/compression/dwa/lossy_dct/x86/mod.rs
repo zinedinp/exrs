@@ -15,7 +15,9 @@ mod avx512;
 mod sse2;
 
 use crate::{
-    compression::simd_tier::x86::{f16c as tier_f16c, v1 as tier_v1, v3 as tier_v3, v4 as tier_v4},
+    compression::simd_tier::x86::{
+        f16c as tier_f16c, miraculix_x86, v1 as tier_v1, v3 as tier_v3, v4 as tier_v4,
+    },
     error::Result as ExrResult,
 };
 
@@ -101,7 +103,11 @@ pub(super) fn try_decode_group_fused(
     let (Some(v3), Some(f16c)) = (tier_v3(), tier_f16c()) else {
         return None;
     };
-    Some(avx2::decode_group_fused(v3, f16c, ac, dc, width, height, to_linear, targets, out))
+    // `v3` (AVX2) gates this whole path, so base AVX must
+    // already be present; the CSC step needs its own token since it was
+    // ported to miraculix.
+    let avx = miraculix_x86::avx().expect("AVX confirmed available by the AVX2 tier gate above");
+    Some(avx2::decode_group_fused(v3, f16c, avx, ac, dc, width, height, to_linear, targets, out))
 }
 
 /// AVX-512 analog of `try_decode_group_fused`: same fused shape, but the
@@ -125,5 +131,12 @@ pub(super) fn try_decode_group_fused_avx512(
     let Some(f16c) = tier_f16c() else {
         return None;
     };
-    Some(avx512::decode_group_fused(v4, f16c, ac, dc, width, height, to_linear, targets, out))
+    // AVX-512 gates this path, so base AVX and AVX-512F are both already
+    // present; both CSC tokens are needed.
+    let avx = miraculix_x86::avx().expect("AVX confirmed available by the AVX-512 tier gate above");
+    let avx512f =
+        miraculix_x86::avx512f().expect("AVX-512F confirmed available by the AVX-512 tier gate above");
+    Some(avx512::decode_group_fused(
+        v4, f16c, avx, avx512f, ac, dc, width, height, to_linear, targets, out,
+    ))
 }
