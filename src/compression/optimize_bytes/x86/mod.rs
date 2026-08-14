@@ -1,11 +1,6 @@
 //! Runtime x86 SIMD dispatch for ZIP/RLE byte reconstruct.
-//!
-//! Production order (stage A/B on Zen 5 / AVX-512):
-//! AVX-512 lane -> AVX2 lane + SSE remainder -> SSE -> scalar.
-//!
-//! Layout mirrors DWA DCT (`discrete_cosine_transform/x86/`): one file per
-//! tier, shared dispatch here. Modules are `doc(hidden)`-public so stage
-//! benches can A/B kernels without going through production dispatch.
+//! Production order: AVX-512 lane -> AVX2 lane + SSE rem -> SSE -> scalar.
+//! One file per tier (mirrors DWA DCT x86/). Modules `doc(hidden)`-public for stage A/B benches.
 
 use std::sync::OnceLock;
 
@@ -38,13 +33,13 @@ pub mod ssse3;
 /// never fills a chunk: it still pays for the pre-bias store, the empty
 /// `n_chunks` loop, and the undo-bias-then-delegate-to-AVX2 remainder path
 /// (`avx512.rs`'s `finish_hierarchical`, `done == 0` branch). Measured a
-/// reproducible ~0.86x vs scalar at n=48 from that overhead alone -- below
+/// reproducible ~0.86x vs scalar at n=48 from that overhead alone: below
 /// this threshold, go straight to AVX2 (whose own SSE tail is what AVX-512
 /// would have delegated to anyway, minus the wasted bias round-trip).
 const AVX512_MIN_LEN: usize = 64;
 
 /// The best tier this CPU supports, resolved once (see [`resolved_tier`]).
-/// Each rung carries every token its own kernel (and its fallbacks) need -
+/// Each rung carries every token its own kernel (and its fallbacks) need:
 /// miraculix hands out one token per CPU feature rather than pulp's one
 /// bundled struct per tier, and there is no `Deref` chain between them.
 #[derive(Clone, Copy)]
@@ -69,7 +64,7 @@ enum Tier {
 }
 
 /// CPU features don't change at runtime, but every call to `differences_to_samples`
-/// (once per DWA DC section / ZIP·RLE chunk, hundreds of times per image) would
+/// (once per DWA DC section / ZIP/RLE chunk, hundreds of times per image) would
 /// re-run the full tier cascade otherwise. Resolve it once per process instead
 /// and reuse the tokens (each `from_features` call is just a cached-bitset
 /// check, not a fresh CPUID probe, but the tier match itself is worth caching

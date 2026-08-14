@@ -1,7 +1,7 @@
-// AVX2+F16C: one 8x8/step. Zigzag = OpenEXR `fromHalfZigZag_f16c` shuffle +
-// F16C widen. `decode_group_fused` keeps unRLE→write L1-hot (~1 KiB/block).
-// `zigzag_block`/`write_block` also serve avx512 (no AVX-512 zigzag; DC-only /
-// odd tail fallback). SSE2 fusion was a ~1% regression vs strip-tile — unshipped.
+// AVX2+F16C: one 8x8/step. Zigzag = OpenEXR `fromHalfZigZag_f16c` shuffle + F16C widen.
+// `decode_group_fused` keeps unRLE->write L1-hot (~1 KiB/block).
+// `zigzag_block`/`write_block` also serve avx512 (no AVX-512 zigzag; DC-only/odd tail fallback).
+// SSE2 fusion was a ~1% regression vs strip-tile: unshipped.
 
 use std::convert::TryInto;
 
@@ -149,7 +149,7 @@ pub(super) fn decode_group_fused(
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
 
-    // One spatial block's components. 3 × 256 B = 768 B -> stays in L1 for the
+    // One spatial block's components. 3 x 256 B = 768 B -> stays in L1 for the
     // whole unRLE -> write pipeline of that block (OpenEXR's shape).
     let mut dct_blocks = [[0.0f32; 64]; 3];
     let mut needs_inverse = [false; 3];
@@ -178,7 +178,7 @@ pub(super) fn decode_group_fused(
             // Keeps the 768 B block set hot end-to-end instead of reloading a
             // multi-block strip four times. Extracted into
             // `decode_one_block_dct_csc_write` so `miraculix::avx_fn!` can
-            // wrap the whole thing -- see that function's doc.
+            // wrap the whole thing: see that function's doc.
             if let Some(err) = decode_one_block_dct_csc_write(
                 f16c, avx, components, &needs_inverse, &mut dct_blocks, block_x, block_y, x_count,
                 y_count, to_linear, targets, out,
@@ -197,7 +197,7 @@ pub(super) fn decode_group_fused(
 // composes 2 register transposes plus the row/column-pass butterfly
 // (dozens of chained token-method calls) that need a shared
 // `#[target_feature]` context to inline into real `ymm` code instead of a
-// `callq` chain -- see `discrete_cosine_transform::x86::avx::
+// `callq` chain: see `discrete_cosine_transform::x86::avx::
 // dct_inverse_8x8_batch`'s doc for the `llvm-objdump` finding that caught
 // this.
 miraculix::avx_fn! {
@@ -243,7 +243,7 @@ fn linearize_scalar(value: f32, to_linear: Option<&[u16; 65536]>) -> f16 {
 /// Per-lane `to_linear` table gather. Unlike the pre-port pulp code (whose
 /// `__m128i` register had no per-lane indexing and needed a GPR
 /// extract/lookup/insert roundtrip), a miraculix register *is* a plain
-/// `[u16; N]` array, so the gather is just array indexing -- no SIMD op at
+/// `[u16; N]` array, so the gather is just array indexing: no SIMD op at
 /// any width, shared unchanged by every write-row variant below (8- and
 /// 16-lane alike).
 #[inline(always)]
@@ -373,7 +373,7 @@ fn u16x8_from_u8x16(v: [u8; 16]) -> [u16; 8] {
 // transpose + a handful of `pshuflw`/`pshufhw`/`pshufd`/`palignr`/`pblendw`
 // fixups, rather than 64 independent scalar loads. Ported 1:1
 // intrinsic-for-intrinsic from the original SSE/SSSE3/SSE4.1/F16C sequence
-// (see `test::zigzag_simd_matches_scalar` for the bit-exact oracle) -- not a
+// (see `test::zigzag_simd_matches_scalar` for the bit-exact oracle): not a
 // place to redesign, the shuffle network's shape is exactly what OpenEXR
 // measured to beat a plain gather.
 miraculix::sse41_f16c_fn! {

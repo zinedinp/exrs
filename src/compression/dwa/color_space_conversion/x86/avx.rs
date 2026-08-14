@@ -1,10 +1,5 @@
-// AVX tier: the CSC transform is a fixed per-element linear combination
-// of three same-length arrays (no cross-lane shuffles needed), so each 8-wide
-// chunk of the 64-element block is loaded, combined, and stored independently.
-// Needs only the base `Avx` token (f32 arithmetic), unlike `optimize_bytes`,
-// CSC never touches AVX2 integer ops, but the file keeps the `avx2.rs` name
-// since this is the kernel the AVX2/F16C fused decode path (`lossy_dct`)
-// reaches for.
+// AVX tier: fixed per-element linear combo of three f32 arrays (no cross-lane shuffles).
+// Base `Avx` only (f32). File name keeps avx convention used by the AVX2/F16C fused decode path.
 
 use miraculix::x86::ops::avx::avx::Avx;
 

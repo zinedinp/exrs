@@ -1,11 +1,9 @@
-// Runtime x86 SIMD dispatch for the DWA CSC transform: `try_csc709_*_8x8_batch`
-// select the AVX2 tier when available and fall back to the SSE2 tier,
-// otherwise let the caller use the scalar autovectorized path.
+// Runtime x86 SIMD dispatch for the DWA CSC transform: AVX tier, else SSE, else scalar autovectorized.
 
 use crate::compression::simd_tier::x86::miraculix_x86::{avx, sse};
 
 // public only for benchmarking. Named `avx` not `avx2`: only the base `Avx`
-// token (f32 arithmetic) is used, no AVX2-specific int ops -- see file doc.
+// token (f32 arithmetic) is used, no AVX2-specific int ops: see file doc.
 #[doc(hidden)]
 pub mod avx;
 
@@ -16,7 +14,7 @@ pub mod avx;
 pub mod avx512f;
 
 // public only for benchmarking. Named `sse` not `sse2`: only the base `Sse`
-// token (f32 arithmetic) is used -- see file doc.
+// token (f32 arithmetic) is used: see file doc.
 #[doc(hidden)]
 pub mod sse;
 

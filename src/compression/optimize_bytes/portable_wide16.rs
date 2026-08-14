@@ -1,7 +1,5 @@
-//! Portable 16-byte OpenEXR log-depth `reconstruct`.
-//!
-//! Same algorithm as x86 SSE (`_mm_slli_si128` + `paddb`). Production
-//! fallback on every non-x86 architecture.
+//! Portable 16-byte OpenEXR log-depth `reconstruct` (same algorithm as x86 SSE).
+//! Production fallback on every non-x86 architecture.
 
 use std::convert::TryInto;
 
@@ -12,7 +10,7 @@ pub fn differences_to_samples(buffer: &mut [u8]) {
         return;
     }
 
-    // uint8_t buf[0] += (uint8_t)-128  ≡  wrapping_add(128)
+    // uint8_t buf[0] += (uint8_t)-128  ==  wrapping_add(128)
     buffer[0] = buffer[0].wrapping_add(128);
 
     let mut prev = 0u8;
@@ -22,7 +20,7 @@ pub fn differences_to_samples(buffer: &mut [u8]) {
         let offset = chunk_index * 16;
         let mut d: [u8; 16] = buffer[offset..offset + 16].try_into().unwrap();
 
-        // Per-lane −128 bias (wrapping). Same as XOR 0x80 per byte.
+        // Per-lane -128 bias (wrapping). Same as XOR 0x80 per byte.
         for b in &mut d {
             *b = b.wrapping_add(128);
         }

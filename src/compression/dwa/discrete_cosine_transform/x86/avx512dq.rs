@@ -1,21 +1,6 @@
-// AVX-512 tier: processes 2 blocks per 512-bit register instead of
-// inventing a new 16-lane-interleaved algorithm. Block A lives in float lanes
-// 0-7 (the low 256 bits, i.e. sub-lanes 0-1 of the four 128-bit sub-lanes a
-// zmm register has), block B in lanes 8-15 (sub-lanes 2-3). Every op below
-// except the final transpose recombination is lane-preserving (never crosses
-// a 128-bit sub-lane boundary), so `row_pass`/`column_pass`'s butterfly math
-// is a mechanical width-doubling of `avx2.rs` — same coefficients, same
-// shape, just running block A's and block B's arithmetic side by side in one
-// instruction instead of two.
-//
-// Transpose recombine (AVX's `permute2f128_f32x8`):
-// - `shuffle_f32x16` alone cannot express a-b-a-b (dest 128-bit lanes 0-1
-//   always from a, 2-3 from b).
-// - A pure zmm shuffle chain (or a 2-source permute) is bit-exact, but LLVM
-//   rewrites it into `vpermt2pd`, which is ~1.8x slower than the AVX batch
-// - Instead: split each zmm into its two ymm halves (`Avx512Dq::
-//   extract_f32x8_from_x16`/`insert_f32x8_into_x16`, plus a plain array
-//   slice for the "low half"
+// AVX-512: 2 blocks per 512-bit register (A in lanes 0-7, B in 8-15). Lane-preserving butterfly =
+// width-doubled `avx2.rs` (same coeffs). Transpose recombine uses AVX `permute2f128` per ymm half
+// (`shuffle_f32x16` cannot express a-b-a-b; pure zmm shuffle rewrites to slow `vpermt2pd`).
 
 use miraculix::x86::ops::avx::avx::Avx;
 use miraculix::x86::ops::avx512::avx512dq::Avx512Dq;
@@ -120,7 +105,7 @@ impl Coefficients {
 }
 
 // Mechanical width-doubling of `avx2::row_pass` (same butterfly, f32x16
-// instead of f32x8) -- this step is purely elementwise, so it never needs to
+// instead of f32x8): this step is purely elementwise, so it never needs to
 // know about the block-A/block-B split at all.
 //
 // Fusing via a mul-add FMA op was tried and reverted:
@@ -280,7 +265,7 @@ miraculix::avx512_fn! {
 // Wrapped in `miraculix::avx512_fn!` (not a plain function): `inverse_pair`
 // alone composes 2 `transpose8x8x2`s (8 unpack + 8 shuffle + 8 `recombine`
 // each, `recombine` itself being 2 extracts + 2 permutes + 1 insert) plus
-// `row_pass`/`column_pass`'s ~40 mul/add/sub -- needs a shared
+// `row_pass`/`column_pass`'s ~40 mul/add/sub: needs a shared
 // `#[target_feature]` context or LLVM refuses to inline any of it, leaving
 // real function calls where vector instructions belong. Confirmed via
 // `llvm-objdump` during the port: unwrapped, this compiled to hundreds of
@@ -289,7 +274,7 @@ miraculix::avx512_fn! {
 // instructions. A closure-based `.vectorize_with_avx_dq()` trampoline was
 // tried first: it fixed the smaller AVX2 case but *not* this one (LLVM's
 // inliner declined to fold the closure into the trampoline for a body this
-// size) -- see `miraculix::x86::fn_macros`' module doc.
+// size): see `miraculix::x86::fn_macros`' module doc.
 miraculix::avx512_fn! {
     pub fn dct_inverse_8x8_batch<'a>(
         avx512f: Avx512f,

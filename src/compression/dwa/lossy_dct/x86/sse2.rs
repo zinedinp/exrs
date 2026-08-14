@@ -1,10 +1,5 @@
-// SSE2-only write-row: covers hosts with no AVX2/F16C (the strip-tiled
-// fallback's write-row step currently has no vectorization at all below the
-// AVX2 tier -- everything falls to scalar per-pixel `linearize_scalar`).
-//
-// SSE2 has no F16C, so unlike `avx2::write_row_f16`/`write_row_f32` there is
-// no hardware `vcvtps2ph`/`vcvtph2ps`.
-// The `to_linear` lookup reuses `avx2::linearize_lanes` unchanged.
+// SSE2-only write-row for hosts without AVX2/F16C (strip-tile write is scalar below AVX2).
+// No F16C: software f32->f16 bits. `to_linear` reuses `avx2::linearize_lanes`.
 
 use std::convert::TryInto;
 
@@ -38,7 +33,7 @@ fn narrow_u32x4_to_u16x4_biased(sse2: Sse2, v: [i32; 4]) -> [u16; 8] {
 /// Lane-wise, branchless, round-to-nearest-even f32->f16 bit conversion for
 /// 4 lanes (an 8-wide row needs two calls, one per half, SSE2's `__m128`
 /// is 4-wide, unlike AVX2's 8-wide `__m256`). Returns 8 lanes with lanes 0-3
-/// the real result and 4-7 a duplicate -- see `narrow_u32x4_to_u16x4_biased`.
+/// the real result and 4-7 a duplicate: see `narrow_u32x4_to_u16x4_biased`.
 #[inline(always)]
 fn f32_bits_to_f16_bits_x4(sse: Sse, sse2: Sse2, x_in: [i32; 4]) -> [u16; 8] {
     const F16_OVERFLOW_EXP_THRESHOLD: i32 = (127 + 16) << 23;
@@ -121,7 +116,7 @@ pub(super) fn write_row_f16(
     let lo_half = f32_bits_to_f16_bits_x4(sse, sse2, lo_bits);
     let hi_half = f32_bits_to_f16_bits_x4(sse, sse2, hi_bits);
     // `punpcklqdq`: the low 64 bits (real lanes 0-3) of each half,
-    // concatenated -- a plain array read, no shuffle instruction needed.
+    // concatenated: a plain array read, no shuffle instruction needed.
     let nonlinear: [u16; 8] = std::array::from_fn(|i| if i < 4 { lo_half[i] } else { hi_half[i - 4] });
 
     let linear = match to_linear {
@@ -165,7 +160,7 @@ pub(super) fn write_row_f32(
     };
 
     // `punpcklwd`/`punpckhwd` against zero: zero-extend each u16 lane to a
-    // u32 lane -- a plain widening cast, no shuffle instruction needed.
+    // u32 lane: a plain widening cast, no shuffle instruction needed.
     let linear_lo32: [i32; 4] = std::array::from_fn(|i| linear[i] as i32);
     let linear_hi32: [i32; 4] = std::array::from_fn(|i| linear[4 + i] as i32);
 

@@ -1,24 +1,22 @@
-// Runtime x86 SIMD dispatch for the DWA DCT: `try_dct_*_8x8_batch` select the
-// AVX tier when available and fall back to the SSE tier, otherwise let the
-// caller use the scalar autovectorized path. Both tiers share the lazily-built
-// `forward_basis` cosine table.
+// Runtime x86 SIMD dispatch for the DWA DCT: AVX tier, else SSE, else scalar autovectorized.
+// Both tiers share the lazily-built `forward_basis` cosine table.
 
 use crate::compression::simd_tier::x86::miraculix_x86::{avx, sse};
 
 // public only for benchmarking. Named `avx` not `avx2`: only the base `Avx`
-// token (f32 arithmetic) is used, no AVX2-specific int ops -- see file doc.
+// token (f32 arithmetic) is used, no AVX2-specific int ops: see file doc.
 #[doc(hidden)]
 pub mod avx;
 
-// Stage-1 prototype (not yet wired into dispatch below) -- public only for
+// Stage-1 prototype (not yet wired into dispatch below): public only for
 // benchmarking/correctness testing. Named `avx512dq`: `Avx512Dq` is the
 // most restrictive of the 3 tokens this file needs (`Avx512f`/`Avx`/
-// `Avx512Dq`) -- not every AVX-512F host has DQ (Knights Landing didn't).
+// `Avx512Dq`): not every AVX-512F host has DQ (Knights Landing didn't).
 #[doc(hidden)]
 pub mod avx512dq;
 
 // public only for benchmarking. Named `sse` not `sse2`: only the base `Sse`
-// token (f32 arithmetic) is used -- see file doc.
+// token (f32 arithmetic) is used: see file doc.
 #[doc(hidden)]
 pub mod sse;
 

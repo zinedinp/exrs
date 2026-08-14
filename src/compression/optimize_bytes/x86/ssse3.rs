@@ -1,17 +1,13 @@
-//! SSE2 / SSSE3 (miraculix `Sse2`/`Ssse3`) ZIP/RLE byte reconstruct;
-//! OpenEXR-faithful 16-byte log-depth prefix sum.
-//!
-//! Reference: `openexr/src/lib/OpenEXRCore/internal_zip.c` (`reconstruct`).
-//! miraculix's ops take/return plain `[u8; N]` arrays (loadu/storeu happen
-//! inside the op itself), so this stays under `#![forbid(unsafe_code)]`
-//! without needing a cast layer.
+//! SSE2/SSSE3 (miraculix `Sse2`/`Ssse3`) ZIP/RLE reconstruct: OpenEXR 16-byte log-depth prefix sum.
+//! Ref: `openexr/src/lib/OpenEXRCore/internal_zip.c` (`reconstruct`).
+//! Ops use plain `[u8; N]` arrays (loadu/storeu inside); stays under `#![forbid(unsafe_code)]`.
 
 use miraculix::x86::ops::sse::sse2::Sse2;
 use miraculix::x86::ops::sse::ssse3::Ssse3;
 
 /// `Ssse3::shuffle_i8x16` takes/returns `[i8; 16]`; our data is `[u8; 16]`.
-/// Byte-shuffle doesn't care about signedness, so this is a pure reinterpret
-/// - safe (no `unsafe`), and `as i8` on same-width integers compiles away.
+/// Byte-shuffle doesn't care about signedness, so this is a pure reinterpret:
+/// safe (no `unsafe`), and `as i8` on same-width integers compiles away.
 /// Shared with `avx2`/`avx512`'s cross-lane carry-broadcast, which does the
 /// same 128-bit `pshufb` dance one or more lanes at a time.
 pub(super) fn to_i8x16(a: [u8; 16]) -> [i8; 16] {
@@ -34,7 +30,7 @@ pub fn differences_to_samples(sse2: Sse2, ssse3: Ssse3, buffer: &mut [u8]) {
         return;
     }
 
-    // uint8_t buf[0] += (uint8_t)-128  ≡  wrapping_add(128)
+    // uint8_t buf[0] += (uint8_t)-128  ==  wrapping_add(128)
     buffer[0] = buffer[0].wrapping_add(128);
 
     let c = [128u8; 16];
@@ -71,7 +67,7 @@ pub fn differences_to_samples(sse2: Sse2, ssse3: Ssse3, buffer: &mut [u8]) {
 /// Continue reconstruct from `start` with known previous sample `prev`.
 ///
 /// Used as the hierarchical remainder after AVX2/AVX-512 full chunks (no
-/// first-byte pre-bias — caller already integrated earlier bytes).
+/// first-byte pre-bias : caller already integrated earlier bytes).
 #[inline]
 pub fn differences_to_samples_from(
     sse2: Sse2,

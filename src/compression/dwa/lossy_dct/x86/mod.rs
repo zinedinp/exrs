@@ -1,14 +1,6 @@
-// Runtime x86 SIMD dispatch for the DWA fused lossy-DCT decode path: picks
-// the AVX-512 tier (2 spatial blocks/register for DCT/CSC, 16-lane write for
-// adjacent pairs) when available, else the AVX2+F16C tier (1 block per step,
-// fused unRLE -> zigzag -> iDCT -> CSC -> write so the ~1 KiB working set
-// stays L1-hot instead of four passes over a wide strip tile), else lets the
-// caller fall back to the strip-tiled scalar/SSE2 path.
-//
-// Kernels live in `avx2`/`avx512` (one file per tier, mirroring how
-// `discrete_cosine_transform::x86` and `color_space_conversion::x86` are
-// organized); this file only decides which tier applies and owns the one
-// piece genuinely shared by both tiers' write-row conversion.
+// Runtime x86 SIMD dispatch for DWA fused lossy-DCT decode.
+// Order: AVX-512 (2 blocks/reg, 16-lane pair write) -> AVX2+F16C fused unRLE->write -> strip-tile scalar/SSE2.
+// Kernels in `avx2`/`avx512`/`sse2`; this file picks the tier and owns shared write-row convert constants.
 
 mod avx2;
 mod avx512;

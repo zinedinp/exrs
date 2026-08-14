@@ -1,9 +1,4 @@
-// SSE tier: same per-element linear combination as the avx tier, just
-// 4-wide instead of 8-wide (16 chunks of the 64-element block instead of 8).
-// Needs only the base `Sse` token (f32 arithmetic), unlike `optimize_bytes`,
-// CSC never touches integer/double SSE2 ops, but the file keeps the `sse2.rs`
-// name to match the "one file per SIMD tier" convention shared with
-// `discrete_cosine_transform`/`lossy_dct`.
+// SSE tier: same CSC as avx, 4-wide instead of 8-wide. Base `Sse` only (f32 arithmetic).
 
 use miraculix::x86::ops::sse::sse::Sse;
 

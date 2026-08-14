@@ -1,7 +1,5 @@
-// AVX tier: OpenEXR's "dctInverse8x8_avx_0". Each pass runs all 8
-// rows/columns of the block in parallel, one 8-wide register per position.
-// Despite the "avx2" filename (kept to match the tier-file convention shared
-// with `color_space_conversion`/`lossy_dct`), every op here is base AVX
+// AVX tier: OpenEXR `dctInverse8x8_avx_0`. All 8 rows/columns in parallel, one f32x8 per position.
+// Base `Avx` only (filename keeps tier convention with color_space_conversion/lossy_dct).
 
 use miraculix::x86::ops::avx::avx::Avx;
 
@@ -221,7 +219,7 @@ pub(crate) fn inverse_one(avx: Avx, coef: &Coefficients, data: &mut [f32; 64]) {
 
 // Wrapped in `miraculix::avx_fn!` (not a plain function): `inverse_one`
 // alone composes 2 `transpose8x8`s (8 unpack + 8 shuffle + 8 permute2f128
-// each) plus `row_pass`/`column_pass`'s ~40 mul/add/sub -- needs a shared
+// each) plus `row_pass`/`column_pass`'s ~40 mul/add/sub: needs a shared
 // `#[target_feature]` context or LLVM refuses to inline any of it into the
 // caller, leaving real function calls (with a loadu/storeu round trip per
 // call) where vector instructions belong. Confirmed via `llvm-objdump`

@@ -1,7 +1,5 @@
-// SSE tier: OpenEXRs "dctInverse8x8_sse2". Vectorizes 4
-// output positions of one row at a time a different shape than "avx2",
-// so the two are not bit-identical. Needs only the base `Sse` token (f32
-// arithmetic). sse2 name to change
+// SSE tier: OpenEXR `dctInverse8x8_sse2`. 4 output positions of one row at a time (shape differs from AVX).
+// Base `Sse` only (f32 arithmetic).
 
 use miraculix::x86::ops::sse::sse::Sse;
 

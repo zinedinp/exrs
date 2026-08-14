@@ -1,15 +1,6 @@
-// AVX-512 (V4) tier: the DCT/CSC step processes 2 spatial blocks at once
-// (one 512-bit register per step); zigzag and the odd-block/DC-only
-// fallbacks stay on the AVX2 tier's single-block kernels (`avx2::
-// zigzag_block`/`avx2::write_block`, imported below) -- there is no
-// AVX-512-widened zigzag shuffle network. Write does widen: for a
-// horizontally-adjacent block pair, `write_pair_block` covers both blocks'
-// row in one native 16-lane AVX-512F conversion instead of two 8-lane ones.
-//
-// If only one block of a pair is DC-only, that component skips the paired
-// DCT kernel (it would re-run iDCT over already-final spatial data) and
-// falls back to the single-block AVX2 kernel instead. An odd trailing block
-// also falls back to the AVX2 tier's single-block fused body.
+// AVX-512: DCT/CSC does 2 spatial blocks per 512-bit register; zigzag/DC-only/odd tail stay on AVX2 kernels.
+// Write widens: `write_pair_block` covers an adjacent pair with one 16-lane convert instead of two 8-lane ones.
+// Mixed DC-only in a pair, or a trailing odd block, falls back to the AVX2 single-block fused body.
 
 use miraculix::x86::ops::avx::avx::Avx;
 use miraculix::x86::ops::avx::f16c::F16c;
@@ -38,7 +29,7 @@ use super::ROUND_TO_NEAREST;
 /// 16-sample span of `out`, so one native `vcvtps2ph`/`vcvtph2ps` (AVX-512F,
 /// no separate F16C needed) and one store cover both blocks at once instead
 /// of two 8-wide passes. Callers must only take this path when the pair is
-/// actually contiguous and block B is full-width -- see the eligibility
+/// actually contiguous and block B is full-width: see the eligibility
 /// check in `step_pair_or_single`.
 #[inline(always)]
 fn write_pair_block(
@@ -84,9 +75,9 @@ fn write_pair_block(
 }
 
 // RGB component dual-port is **opt-in** (`dwa-avx512-rgb-comp-quad`): when R and
-// G both need pair-iDCT, `inverse_quad(R∥G)` then needs-match B. Microbench is
-// a real win; whole-pipeline A/B regressed `lossy_dct` slightly — default stays
-// the sequential 3× `inverse_pair` loop. Profile counters (under `dwa-profile`)
+// G both need pair-iDCT, `inverse_quad(R/G)` then needs-match B. Microbench is
+// a real win; whole-pipeline A/B regressed `lossy_dct` slightly : default stays
+// the sequential 3x `inverse_pair` loop. Profile counters (under `dwa-profile`)
 // record pair-step / quad-hit rate when the feature is on.
 // Wrapped in `miraculix::avx512_fn!` (not a plain function): this body
 // composes DCT's 8x8x2 register-transpose (unpack + shuffle + `Avx::
@@ -187,7 +178,7 @@ miraculix::avx512_fn! {
 }
 
 /// One step of the fused loop: a pair (2 blocks) via the 2-block DCT+CSC
-/// kernel, or -- if only one block remains -- a single block via the AVX2
+/// kernel, or: if only one block remains: a single block via the AVX2
 /// single-block kernel. Shared by `decode_group_fused` (every step) so the
 /// pair path and its odd-block tail cannot diverge. Returns the next
 /// `block_index` (advanced by 1 or 2) and any error.
@@ -312,12 +303,12 @@ miraculix::avx_fn! {
     }
 }
 
-// Spatial 4-block `inverse_quad` fused decode (zigzag×4 then DCT×4) was A/B'd
+// Spatial 4-block `inverse_quad` fused decode (zigzagx4 then DCTx4) was A/B'd
 // 2026-07-27 and reverted: isolated DCT +6.4% did not survive whole-pipeline
 // (noise only) because the doubled zigzag-before-DCT working set ate the win.
-// Component-level R∥G dual-port is a different idea (same spatial pair, no extra
-// zigzag): micro +6–11%, pipeline flat-to-worse across sessions → opt-in only
-// via `dwa-avx512-rgb-comp-quad`. Production default is sequential 3× inverse_pair.
+// Component-level R/G dual-port is a different idea (same spatial pair, no extra
+// zigzag): micro +6-11%, pipeline flat-to-worse across sessions -> opt-in only
+// via `dwa-avx512-rgb-comp-quad`. Production default is sequential 3x inverse_pair.
 
 /// AVX-512 analog of `avx2::decode_group_fused`: same fused shape, but the
 /// DCT/CSC step processes 2 spatial blocks at once (one 512-bit register per
@@ -369,7 +360,7 @@ pub(super) fn decode_group_fused(
 // block B's row in lanes 8-15. `f32_to_f16x16`/`f16_to_f32x16` are AVX-512F's
 // own native half conversion (unlike the AVX2 path, no separate F16C
 // capability check needed). The `to_linear` gather is `linearize_lanes`
-// unchanged at 16 lanes -- a miraculix register is a plain array, so unlike
+// unchanged at 16 lanes: a miraculix register is a plain array, so unlike
 // the pre-port pulp code (which needed a real gather instruction or a
 // GPR extract/lookup/insert roundtrip it didn't have below AVX-512), this is
 // just per-lane indexing at whatever width the caller passes.
@@ -445,7 +436,7 @@ miraculix::avx512f_fn! {
 
 // AVX-512 write-pair correctness tests. Opt-in via `avx512-tests`, same
 // convention as the DCT/CSC AVX-512 test modules (`expect_avx512` panics
-// rather than skipping -- this project's dev/bench host always has AVX-512).
+// rather than skipping: this project's dev/bench host always has AVX-512).
 #[cfg(all(test, feature = "avx512-tests"))]
 mod test {
     use half::f16;
@@ -575,7 +566,7 @@ mod test {
 
     /// End-to-end: `write_pair_block` (the function actually wired into the
     /// fused AVX-512 decode path) must produce byte-identical output to
-    /// calling the single-block `write_block` twice -- proves the pair-write
+    /// calling the single-block `write_block` twice: proves the pair-write
     /// eligibility wiring in `step_pair_or_single` slices rows and offsets
     /// the same way, on top of the row-level bit-exactness above.
     #[test]

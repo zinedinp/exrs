@@ -1,10 +1,5 @@
-// AVX-512F tier: CSC is a fixed per-element linear combination of three
-// same-length arrays with no cross-lane shuffles, so unlike the DCT's
-// transpose this ports to 2-blocks-per-register by pure mechanical widening.
-// load block A's 8-wide chunk into lanes 0-7 and block B's into lanes 8-15,
-// run the same elementwise math, store back. No permute/shuffle needed at all.
-// (DCT needs insert/extract load packing; pure elementwise CSC is fine with
-// a scalar-lane `[f32; 16]` array built directly.)
+// AVX-512F CSC: pure elementwise widen to 2 blocks/register (A lanes 0-7, B 8-15).
+// No permute needed (unlike DCT transpose). Base `Avx512f` only.
 
 use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
