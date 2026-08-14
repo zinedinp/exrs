@@ -11,7 +11,7 @@ use miraculix::x86::ops::sse::ssse3::Ssse3;
 use super::avx2 as avx2_mod;
 use super::ssse3::{to_i8x16, to_u8x16};
 
-/// Production AVX-512 entry: lane-prefix with hierarchical remainder.
+/// Production AVX-512 entry: lane-prefix + hierarchical rem.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn differences_to_samples(
@@ -25,7 +25,7 @@ pub fn differences_to_samples(
     differences_to_samples_lane(f, bw, avx2, sse2, ssse3, buffer);
 }
 
-/// AVX-512 lane-prefix reconstruct with hierarchical remainder.
+/// Lane-prefix 64B chunks + hierarchical rem (AVX2 -> SSE -> scalar).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn differences_to_samples_lane(
@@ -39,8 +39,7 @@ pub fn differences_to_samples_lane(
     run_lane(f, bw, avx2, sse2, ssse3, buffer, Tail::Hierarchical);
 }
 
-/// Same 64-byte lane body; remainder is one zero-padded ZMM pass (store live
-/// bytes only).
+/// Same 64B lane body; rem is one zero-padded ZMM pass (store live bytes only).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn differences_to_samples_lane_masked(
@@ -95,7 +94,7 @@ miraculix::avx512bw_fn! {
 
             buffer[offset..offset + 64].copy_from_slice(&d);
 
-            // Next carry = broadcast of d[63].
+            // Next carry = broadcast d[63].
             let last128 = f.extract_u8x16_from_x64::<3>(d);
             let last = to_u8x16(ssse3.shuffle_i8x16(to_i8x16(last128), shuffle15));
             v_prev = bw.broadcast_u8x64(last[0]);
@@ -110,7 +109,7 @@ miraculix::avx512bw_fn! {
 }
 
 miraculix::avx512bw_fn! {
-    /// Within-lane log-depth + cascade fixups + previous-chunk carry.
+    /// Lane-local log-depth + cascade fixups + prev-chunk carry.
     fn process_chunk(
         f: Avx512f,
         bw: Avx512Bw,
@@ -123,14 +122,13 @@ miraculix::avx512bw_fn! {
     ) -> [u8; 64] {
         let mut d = d;
         d = bw.add_u8x64(d, c);
-        // Four independent 16-byte OpenEXR trees (bslli is lane-local).
+        // Four independent 16B OpenEXR trees (`bslli` is 128-bit-lane-local).
         d = bw.add_u8x64(d, bw.bslli_u8x64::<1>(d));
         d = bw.add_u8x64(d, bw.bslli_u8x64::<2>(d));
         d = bw.add_u8x64(d, bw.bslli_u8x64::<4>(d));
         d = bw.add_u8x64(d, bw.bslli_u8x64::<8>(d));
 
-        // Cascade: lane i (i>0) += last byte of reconstructed lane i-1.
-        // `extract_u8x16_from_x64::<N>` selects 128-bit lane 0..3.
+        // Cascade: lane i (i>0) += last of reconstructed lane i-1.
         let l0 = f.extract_u8x16_from_x64::<0>(d);
         let l1 = f.extract_u8x16_from_x64::<1>(d);
         let l2 = f.extract_u8x16_from_x64::<2>(d);
@@ -153,7 +151,7 @@ miraculix::avx512bw_fn! {
     }
 }
 
-/// Remainder: AVX2 (>=32) -> SSE (>=16) -> scalar.
+/// Rem: AVX2 (>=32) -> SSE (>=16) -> scalar.
 #[inline]
 fn finish_hierarchical(
     avx2: Avx2,
@@ -167,7 +165,7 @@ fn finish_hierarchical(
         return;
     }
     if done == 0 {
-        // No full 64-byte chunk: undo pre-bias and drop to AVX2/SSE path.
+        // No 64B chunk: undo pre-bias, drop to AVX2/SSE.
         buffer[0] = buffer[0].wrapping_sub(128);
         avx2_mod::differences_to_samples_lane_sse_tail(avx2, sse2, ssse3, buffer);
         return;
@@ -176,7 +174,7 @@ fn finish_hierarchical(
     avx2_mod::differences_to_samples_from(avx2, sse2, ssse3, buffer, done, carry);
 }
 
-/// Remainder: zero-pad to 64, one process_chunk, store live prefix only.
+/// Rem: zero-pad to 64, one `process_chunk`, store live prefix only.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn finish_padded(
@@ -198,7 +196,7 @@ fn finish_padded(
 
     let mut tmp = [0u8; 64];
     tmp[..rem].copy_from_slice(&buffer[done..]);
-    // When done==0, v_prev is zero (first-byte pre-bias already applied).
+    // done==0: v_prev is zero (first-byte pre-bias already applied).
     let d = process_chunk(f, bw, sse2, ssse3, tmp, c, shuffle15, v_prev);
     buffer[done..].copy_from_slice(&d[..rem]);
 }

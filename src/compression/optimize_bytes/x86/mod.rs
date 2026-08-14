@@ -12,36 +12,27 @@ use miraculix::x86::ops::sse::ssse3::Ssse3;
 
 use crate::compression::simd_tier::x86::miraculix_x86;
 
-// public only for benchmarking / correctness tests
+// A/B benches and correctness tests.
 #[doc(hidden)]
 pub mod avx2;
 use self::avx2 as avx2_dispatch;
 
-// public only for benchmarking / correctness tests. Named `avx512bw`:
-// `Avx512Bw` is the most restrictive of this file's 5 tokens (byte/word
-// integer ops need BW, not just base `Avx512f`).
+// Named `avx512bw`: BW is the most restrictive of this file's 5 tokens
+// (byte/word integer ops need BW, not just base `Avx512f`).
 #[doc(hidden)]
 pub mod avx512bw;
 
-// public only for benchmarking / correctness tests. Named `ssse3`, not
-// `sse`: this file's carry-propagation shuffle needs `Ssse3`, not just the
-// base `Sse2` token.
+// Named `ssse3`, not `sse`: carry-propagation shuffle needs `Ssse3`, not
+// just the base `Sse2` token.
 #[doc(hidden)]
 pub mod ssse3;
 
-/// Below one full 64-byte AVX-512 lane, `avx512bw::differences_to_samples`
-/// never fills a chunk: it still pays for the pre-bias store, the empty
-/// `n_chunks` loop, and the undo-bias-then-delegate-to-AVX2 remainder path
-/// (`avx512.rs`'s `finish_hierarchical`, `done == 0` branch). Measured a
-/// reproducible ~0.86x vs scalar at n=48 from that overhead alone: below
-/// this threshold, go straight to AVX2 (whose own SSE tail is what AVX-512
-/// would have delegated to anyway, minus the wasted bias round-trip).
+/// Skip AVX-512 below one full 64B lane: empty-loop + undo-bias overhead
+/// measured ~0.86x vs scalar at n=48. Drop to AVX2 (same hierarchical tail).
 const AVX512_MIN_LEN: usize = 64;
 
-/// The best tier this CPU supports, resolved once (see [`resolved_tier`]).
-/// Each rung carries every token its own kernel (and its fallbacks) need:
-/// miraculix hands out one token per CPU feature rather than pulp's one
-/// bundled struct per tier, and there is no `Deref` chain between them.
+/// Best supported tier, tokens included. One miraculix token per feature
+/// (no pulp-style bundled tier struct / `Deref` chain).
 #[derive(Clone, Copy)]
 enum Tier {
     Avx512 {
@@ -63,12 +54,8 @@ enum Tier {
     Scalar,
 }
 
-/// CPU features don't change at runtime, but every call to `differences_to_samples`
-/// (once per DWA DC section / ZIP/RLE chunk, hundreds of times per image) would
-/// re-run the full tier cascade otherwise. Resolve it once per process instead
-/// and reuse the tokens (each `from_features` call is just a cached-bitset
-/// check, not a fresh CPUID probe, but the tier match itself is worth caching
-/// too).
+/// Resolve once per process: features are static; cascade runs once per
+/// DWA DC / ZIP/RLE chunk otherwise.
 fn resolved_tier() -> Tier {
     static TIER: OnceLock<Tier> = OnceLock::new();
     *TIER.get_or_init(|| {
@@ -106,10 +93,8 @@ fn resolved_tier() -> Tier {
     })
 }
 
-/// Dispatch to the best available tier (resolved once, see [`resolved_tier`]).
-/// AVX-512 is only used for buffers >= 64B; smaller buffers on an AVX-512 host
-/// drop straight to AVX2 (the cached tokens, no second feature probe).
-/// Returns `true` if a SIMD path ran.
+/// Best tier once ([`resolved_tier`]). AVX-512 only for `len >= 64`; smaller
+/// buffers on AVX-512 hosts drop to cached AVX2 tokens. `true` if SIMD ran.
 #[inline]
 pub(super) fn try_differences_to_samples(buffer: &mut [u8]) -> bool {
     match resolved_tier() {

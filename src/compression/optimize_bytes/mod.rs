@@ -36,7 +36,8 @@ pub fn differences_to_samples(buffer: &mut [u8]) {
 /// Derive differences to the previous value (`diff[i] = sample[i] - sample[i-1] + 128`).
 ///
 /// Encode-side; already near memory bandwidth with the scalar 16-wide form, so
-/// no SIMD dispatch (A/B was ~1.0×). x86 SIMD port is commented out in `x86/sse.rs`.
+/// no SIMD dispatch (A/B was ~1.0×). The SIMD attempt was measured, not shipped,
+/// and removed entirely during the miraculix port rather than kept commented.
 pub fn samples_to_differences(buffer: &mut [u8]) {
     samples_to_differences_scalar(buffer);
 }
@@ -46,7 +47,8 @@ pub fn samples_to_differences(buffer: &mut [u8]) {
 ///
 /// Scalar only: on measured x86-64 the simple pair loop (already near memcpy
 /// bandwidth once the final copy-back is included) matches or beats the SSE2
-/// unpack port. SIMD kernels remain commented in `x86/sse.rs` with the A/B reason.
+/// unpack port. The SIMD attempt was measured, not shipped, and removed
+/// entirely during the miraculix port rather than kept commented.
 pub fn interleave_byte_blocks(separated: &mut [u8]) {
     with_reused_buffer(separated.len(), |interleaved| {
         interleave_byte_blocks_scalar(separated, interleaved);
