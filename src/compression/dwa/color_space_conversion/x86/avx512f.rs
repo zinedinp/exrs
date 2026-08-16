@@ -1,6 +1,4 @@
 // AVX-512F CSC: pure elementwise widen to 2 blocks/register (A lanes 0-7, B 8-15).
-// No permute needed (unlike DCT transpose). Base `Avx512f` only.
-
 use miraculix::x86::ops::avx512::avx512f::Avx512f;
 
 #[inline(always)]

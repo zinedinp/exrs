@@ -1,6 +1,6 @@
 //! AVX-512 (miraculix `Avx512f`+`Avx512Bw`+`Avx2`+`Sse2`+`Ssse3`) ZIP/RLE reconstruct -> 64-byte chunks.
 //! Production: four 16-byte OpenEXR trees + cascade carry; rem AVX2 32 -> SSE 16 -> scalar.
-//! Masked partial-chunk path kept for re-bench. `bslli_u8x64` is 128-bit-lane-local (same as AVX2 lane lesson).
+//! Masked partial-chunk path kept for re-bench. `bslli_u8x64` is 128-bit-lane-local.
 
 use miraculix::x86::ops::avx::avx2::Avx2;
 use miraculix::x86::ops::avx512::avx512bw::Avx512Bw;

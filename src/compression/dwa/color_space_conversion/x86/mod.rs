@@ -1,4 +1,4 @@
-// Runtime x86 SIMD dispatch for the DWA CSC transform: AVX tier, else SSE, else scalar autovectorized.
+// Runtime x86 SIMD dispatch for the DWA CSC transform
 
 use crate::compression::simd_tier::x86::miraculix_x86::{avx, sse};
 

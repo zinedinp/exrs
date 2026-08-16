@@ -1,6 +1,5 @@
 //! Runtime x86 SIMD dispatch for ZIP/RLE byte reconstruct.
 //! Production order: AVX-512 lane -> AVX2 lane + SSE rem -> SSE -> scalar.
-//! One file per tier (mirrors DWA DCT x86/). Modules `doc(hidden)`-public for stage A/B benches.
 
 use std::sync::OnceLock;
 

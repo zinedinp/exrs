@@ -1,5 +1,4 @@
 // AVX tier: fixed per-element linear combo of three f32 arrays (no cross-lane shuffles).
-// Base `Avx` only (f32). File name keeps avx convention used by the AVX2/F16C fused decode path.
 
 use miraculix::x86::ops::avx::avx::Avx;
 

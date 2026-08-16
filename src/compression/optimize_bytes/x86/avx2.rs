@@ -1,6 +1,6 @@
 //! AVX2 (miraculix `Avx2`+`Sse2`+`Ssse3`) ZIP/RLE byte reconstruct -> 32-byte chunks.
 //! Production: lane-prefix + SSE tail ([`differences_to_samples`]). A/B: scalar tail / full 32-wide tree.
-//! `Avx2::slli_u8x32` is lane-local; full Hillis-Steele needs extract/alignr and loses to lane.
+//! `Avx2::slli_u8x32` is lane-local; Hillis-Steele needs extract/alignr and loses to lane.
 
 use miraculix::x86::ops::avx::avx2::Avx2;
 use miraculix::x86::ops::sse::sse2::Sse2;
