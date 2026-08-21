@@ -5,7 +5,7 @@
 
 use std::panic::catch_unwind;
 
-use rand::{rngs::StdRng, RngExt};
+use rand::{RngExt, rngs::StdRng};
 
 extern crate exr;
 use std::{

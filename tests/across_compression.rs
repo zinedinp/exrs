@@ -129,7 +129,7 @@ fn compare_compression_contents_zips_f16() {
 #[test]
 fn compare_compression_contents_b44_f32() {
     expect_eq_uncompressed("f32", "b44.exr"); // f32s are not compressed in b44
-                                              // and can be compared exactly
+    // and can be compared exactly
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn compare_compression_contents_b44_f16() {
 #[test]
 fn compare_compression_contents_b44a_f32() {
     expect_eq_uncompressed("f32", "b44a.exr"); // f32s are not compressed in b44
-                                               // and can be compared exactly
+    // and can be compared exactly
 }
 
 #[test]

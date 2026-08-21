@@ -1159,7 +1159,7 @@ impl ChannelDescription {
         strict: bool,
     ) -> UnitResult {
         self.name.validate(true, None)?; // TODO spec says this does not affect `requirements.long_names` but is that
-                                         // true?
+        // true?
 
         if self.sampling.x() == 0 || self.sampling.y() == 0 {
             return Err(Error::invalid("zero sampling factor"));
@@ -1786,8 +1786,8 @@ pub fn validate(
 ) -> UnitResult {
     name.validate(true, Some(long_names))?; // only name text has length restriction
     value.validate(allow_sampling, data_window, strict) // attribute value text
-                                                        // length is never
-                                                        // restricted
+    // length is never
+    // restricted
 }
 
 impl AttributeValue {
@@ -1845,7 +1845,7 @@ impl AttributeValue {
 
     /// The exr name string of the type that an attribute can have.
     pub fn kind_name(&self) -> &TextSlice {
-        use self::{type_names as ty, AttributeValue::*};
+        use self::{AttributeValue::*, type_names as ty};
 
         match *self {
             IntegerBounds(_) => ty::I32BOX2,
@@ -1966,7 +1966,7 @@ impl AttributeValue {
         kind: Text,
         byte_size: usize,
     ) -> Result<Result<Self>> {
-        use self::{type_names as ty, AttributeValue::*};
+        use self::{AttributeValue::*, type_names as ty};
 
         // always read bytes as to leave the read position at the end of the attribute
         // even if the attribute contents fails to decode
@@ -2385,7 +2385,9 @@ mod test {
 
         {
             let (name, value) = (
-                Text::from("sdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfpo"),
+                Text::from(
+                    "sdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfposdöksadöofkaspdolkpöasolfkcöalsod,kfcöaslodkcpöasolkfpo",
+                ),
                 AttributeValue::I32(0),
             );
 
